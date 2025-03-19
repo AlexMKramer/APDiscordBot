@@ -11,6 +11,7 @@ import tracker_download
 
 dotenv.load_dotenv()
 discord_token = os.getenv("DISCORD_TOKEN")
+discord_channel_id = os.getenv("DISCORD_CHANNEL_ID")
 tracker_url = os.getenv("TRACKER_URL")
 url_auth_username = os.getenv("URL_AUTH_USERNAME")
 tracker_password = os.getenv("URL_AUTH_PASSWORD")
@@ -36,16 +37,13 @@ async def on_connect():
     bot.loop.create_task(check_tracked_items_loop())
 
     print("Starting system item tracker loop.")
-
-    # Start item tracker loop
-    try:
-        while True:
-            tracker_download.get_all_tracker_received_items(tracker_url, auth)
-            await asyncio.sleep(120)
-    except asyncio.CancelledError:
-        print("System item tracker loop stopped.")
-    except Exception as e:
-        print(f"Error in system item tracker loop: {e}")
+    channel = bot.get_channel(int(discord_channel_id))
+    if channel is None:
+        print(f"Channel with ID {discord_channel_id} not found.")
+        print("No Discord channel ID provided. System item tracker will only send messages to users tracking items.")
+        bot.loop.create_task(no_dm_tracker(tracker_url, auth))
+    else:
+        bot.loop.create_task(check_for_item_changes(tracker_url, auth, discord_channel_id))
 
 
 @bot.event
@@ -211,7 +209,7 @@ async def assign_slot(ctx, slot_name: str):
 
 
 @bot.slash_command(description="Get a DM with a list of items received for a slot.")
-@option("slot_name", description="Enter your slot name.", required=True)
+@option("slot_name", description="Enter your slot name.", autocomplete = slot_name_autocomplete, required=True)
 async def get_items(ctx, slot_name: str):
     # Send an initial ephemeral response to indicate processing.
     initial_response = await ctx.respond(content="Getting items...", ephemeral=True)
@@ -226,7 +224,7 @@ async def get_items(ctx, slot_name: str):
     message = await send_items(ctx, assignment, initial_response)
 
     # Use plain code block formatting (without "ansi").
-    wrapper_length = len("```\n") + len("\n```")
+    wrapper_length = len("``ansi`\n") + len("\n```")
     max_content_length = 2000 - wrapper_length
 
     # Break the message into chunks that fit within Discord's limits.
@@ -235,7 +233,7 @@ async def get_items(ctx, slot_name: str):
     try:
         # DM each chunk to the user.
         for chunk in chunks:
-            await ctx.author.send(f"```\n{chunk}\n```")
+            await ctx.author.send(f"```ansi\n{chunk}\n```")
         await initial_response.edit_original_response(
             content="I've sent you a DM with a list of items for the specified slot."
         )
@@ -300,18 +298,70 @@ async def send_items(ctx, assignment, initial_response):
     game_name_in_data = slot_data.get("Game Name", "Unknown")
     items_dict = slot_data.get("Items", {})
 
-    header = f"Items received for slot '{slot_name}' (Game: {game_name_in_data}):"
+    # Underline the slot name using ANSI escape sequences
+    underline_start = "[4;2m"
+    underline_end = "[0m"
+
+    header = f"{underline_start}Items received for {slot_name}:{underline_end}"
     lines = [header]
 
     # Build a line for each received item
     for key, item_info in items_dict.items():
         item_name = item_info.get("item_name", "Unknown")
         amount = item_info.get("amount", "Unknown")
-        line = f"{item_name} x{amount}"
+        if amount == 1:
+            line = f"{item_name}"
+        else:
+            line = f"{item_name} x{amount}"
         lines.append(line)
 
     message = "\n".join(lines)
     return message
+
+
+# Helper function to format the diff dictionary into a message string.
+def format_diff_message(diff):
+    lines = []
+    for slot, slot_data in diff.items():
+        for slot_name, details in slot_data.items():
+            lines.append(f"New items received for {slot_name}:")
+            new_items = details.get("New Items", {})
+            for item_name, change in new_items.items():
+                lines.append(f"{item_name} +{change}")
+            lines.append("")  # blank line for separation
+    return "\n".join(lines)
+
+async def no_dm_tracker(tracker_url, auth):
+    while True:
+        await tracker_download.get_all_tracker_received_items(tracker_url, auth)
+        await asyncio.sleep(60)
+
+# Loop function to check for changes every 60 seconds and send a DM to a specific channel.
+async def check_for_item_changes(tracker_url, auth, channel_id):
+    await bot.wait_until_ready()
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        print(f"Channel with ID {channel_id} not found.")
+        return
+
+    while not bot.is_closed():
+        # Get the new diff from tracker data.
+        diff = tracker_download.get_all_tracker_received_items(tracker_url, auth)
+        if diff:
+            message = format_diff_message(diff)
+            # Prepare to send the message in a code block.
+            # Adjust the maximum content length to account for the code block wrappers.
+            wrapper_length = len("```\n") + len("\n```")
+            max_content_length = 2000 - wrapper_length
+            chunks = chunk_text_by_line(message, max_content_length)
+            for chunk in chunks:
+                await channel.send(f"```\n{chunk}\n```")
+        else:
+            print("No changes found.")
+
+        # Wait 60 seconds before checking again.
+        await asyncio.sleep(60)
+
 
 # Slash command to DM the user a list of all items for their tracked slots.
 @bot.slash_command(description="Get a list of all items for your tracked slots.")
@@ -352,13 +402,15 @@ async def get_all_tracked_items(ctx):
         combined_message += f"\n{message}\n"
 
     # Prepare the message for DM; use plain text code blocks.
-    wrapper_length = len("```\n") + len("\n```")
+    wrapper_length = len("```ansi\n") + len("\n```")
     max_content_length = 2000 - wrapper_length
     chunks = chunk_text_by_line(combined_message, max_content_length)
 
+
+
     try:
         for chunk in chunks:
-            await ctx.author.send(f"```\n{chunk}\n```")
+            await ctx.author.send(f"```ansi\n{chunk}\n```")
         await initial_response.edit_original_response(
             content="I've sent you a DM with a list of items for the slots you are tracking."
         )
@@ -433,6 +485,7 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
     await initial_response.edit_original_response(
         content=f"Now tracking **{item_name}** (target: {target_amount}) for **{game_name}** under slot **{slot_name}**."
     )
+
 
 
 async def check_tracked_items_loop():

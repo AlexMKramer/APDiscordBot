@@ -97,6 +97,7 @@ def track_items_from_slot(tracker_url, url, auth):
 
 
 def get_all_tracker_received_items(tracker_url, auth):
+    # Build the new result from tracker data
     result = {}
     slot_numbers, urls, slot_names, game_names, games_statuses, checks_statuses = get_tracker_urls(tracker_url, auth)
     for idx, url in enumerate(urls):
@@ -112,7 +113,6 @@ def get_all_tracker_received_items(tracker_url, auth):
         else:
             item_dict = "Game Completed!"
 
-        # Structure the JSON with slot number as key, then slot name containing game name and items.
         result[slot_number] = {
             slot_name: {
                 "Game Name": game_name,
@@ -122,16 +122,68 @@ def get_all_tracker_received_items(tracker_url, auth):
             }
         }
 
-    # Write the results to a JSON file.
+    # Ensure the data subdirectory exists.
     os.makedirs("data", exist_ok=True)
     items_received_json = os.path.join("data", "items_received.json")
 
+    # Load previous results, if they exist.
+    old_result = {}
+    if os.path.exists(items_received_json):
+        try:
+            with open(items_received_json, "r") as infile:
+                old_result = json.load(infile)
+        except Exception as e:
+            print(f"Error loading old items_received file: {e}")
+            old_result = {}
+
+    # Compute diff: aggregate amounts by item name for new and old results,
+    # then record the positive differences.
+    diff = {}
+    for slot, new_slot_data in result.items():
+        # new_slot_data is a dict with a single key: the slot name.
+        for slot_name_key, new_details in new_slot_data.items():
+            new_items = new_details.get("Items", {})
+            # Aggregate new items by item name.
+            new_agg = {}
+            if isinstance(new_items, dict):
+                for key, item in new_items.items():
+                    name = item.get("item_name", "Unknown")
+                    try:
+                        amount = int(item.get("amount", 0))
+                    except:
+                        amount = 0
+                    new_agg[name] = new_agg.get(name, 0) + amount
+
+            # Aggregate old items for the same slot.
+            old_agg = {}
+            if slot in old_result:
+                old_slot_data = old_result[slot]
+                if slot_name_key in old_slot_data:
+                    old_details = old_slot_data[slot_name_key]
+                    old_items = old_details.get("Items", {})
+                    if isinstance(old_items, dict):
+                        for key, item in old_items.items():
+                            name = item.get("item_name", "Unknown")
+                            try:
+                                amount = int(item.get("amount", 0))
+                            except:
+                                amount = 0
+                            old_agg[name] = old_agg.get(name, 0) + amount
+
+            # Compare aggregated values.
+            diff_items = {}
+            for name, new_amount in new_agg.items():
+                old_amount = old_agg.get(name, 0)
+                if new_amount > old_amount:
+                    diff_items[name] = new_amount - old_amount
+
+            if diff_items:
+                diff.setdefault(slot, {})[slot_name_key] = {"New Items": diff_items}
+
+    # Write the new results to the JSON file.
     with open(items_received_json, "w") as outfile:
         json.dump(result, outfile, indent=4)
 
-    # close the file
-    outfile.close()
-
-    print("JSON output saved to output.json")
+    return diff
 
 
