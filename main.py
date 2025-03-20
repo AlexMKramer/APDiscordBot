@@ -597,19 +597,21 @@ def format_diff_message(diff):
     for slot, slot_data in diff.items():
         for slot_name, details in slot_data.items():
 
-            # Underline the slot name using ANSI escape sequences
-            underline_start = "[4;2m"
-            underline_end = "[0m"
-            header = f"{underline_start}Items received for {slot_name}:{underline_end}"
-            lines.append(header)
-
             # Add a game completion message if the game status changed to completed.
-            if "Game Completed" in details:
-                lines.append(f"Game Completed: {details['Game Completed']}")
+            if "Goal Completed" in details:
+                lines.append(f"{slot_name} Goal Completed!  All items released.")
 
-            new_items = details.get("New Items", {})
-            for item_name, change in new_items.items():
-                lines.append(f"{item_name} +{change}")
+            else:
+
+                # Underline the slot name using ANSI escape sequences
+                underline_start = "[4;2m"
+                underline_end = "[0m"
+                header = f"{underline_start}Items received for {slot_name}:{underline_end}"
+                lines.append(header)
+
+                new_items = details.get("New Items", {})
+                for item_name, change in new_items.items():
+                    lines.append(f"{item_name} +{change}")
 
             lines.append("")  # blank line for separation
     return "\n".join(lines)
