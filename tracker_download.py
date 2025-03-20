@@ -137,7 +137,7 @@ def get_all_tracker_received_items(tracker_url, auth):
             old_result = {}
 
     # Compute diff: aggregate amounts by item name for new and old results,
-    # then record the positive differences.
+    # then record the positive differences. Also, check for changes in game status (completed).
     diff = {}
     for slot, new_slot_data in result.items():
         # new_slot_data is a dict with a single key: the slot name.
@@ -172,13 +172,30 @@ def get_all_tracker_received_items(tracker_url, auth):
 
             # Compare aggregated values.
             diff_items = {}
-            for name, new_amount in new_agg.items():
-                old_amount = old_agg.get(name, 0)
-                if new_amount > old_amount:
-                    diff_items[name] = new_amount - old_amount
+            for name, new_total in new_agg.items():
+                old_total = old_agg.get(name, 0)
+                if new_total > old_total:
+                    diff_items[name] = new_total - old_total
 
+            # Check game status for completion.
+            new_game_status = new_details.get("Game Status", "").strip()
+            old_game_status = ""
+            if slot in old_result:
+                old_slot_data = old_result[slot]
+                if slot_name_key in old_slot_data:
+                    old_game_status = old_slot_data[slot_name_key].get("Game Status", "").strip()
+
+            # We consider the game completed if the new status equals "Game Completed!" or "Completed" (case-insensitive).
+            is_completed = new_game_status.lower() in ["goal completed", "completed"]
+
+            diff_entry = {}
             if diff_items:
-                diff.setdefault(slot, {})[slot_name_key] = {"New Items": diff_items}
+                diff_entry["New Items"] = diff_items
+            if is_completed and (new_game_status != old_game_status):
+                diff_entry["Goal Completed"] = new_game_status
+
+            if diff_entry:
+                diff.setdefault(slot, {})[slot_name_key] = diff_entry
 
     # Write the new results to the JSON file.
     with open(items_received_json, "w") as outfile:

@@ -26,6 +26,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='/', intents=intents)
 bot.auto_sync_commands = True
 
+
 @bot.event
 async def on_connect():
     global tracker_url, auth
@@ -51,6 +52,7 @@ async def on_disconnect():
     disconnect_time = datetime.datetime.now()
     print(f'{bot.user.name} failed to reconnect at {disconnect_time}')
     await asyncio.sleep(5)
+
 
 async def game_name_autocomplete(ctx: discord.AutocompleteContext):
     game_names = []
@@ -103,6 +105,24 @@ async def slot_name_autocomplete(ctx: discord.AutocompleteContext):
     return [name for name in slot_names if name.startswith(ctx.value)]
 
 
+async def slot_name_for_assigned_slot_autocomplete(ctx: discord.AutocompleteContext):
+    author_id = str(ctx.interaction.user.id)
+    os.makedirs("data", exist_ok=True)
+    listeners_file_json = os.path.join("data", "listeners.json")
+    with open(listeners_file_json, "r") as f:
+        try:
+            listeners_data = json.load(f)
+        except json.JSONDecodeError:
+            listeners_data = {}
+
+    if author_id not in listeners_data:
+        return []  # No assignments for this user
+
+    assignments = listeners_data[author_id]
+    slot_names = [assignment.get("slot_name") for assignment in assignments]
+    return [name for name in slot_names if name.startswith(ctx.value)]
+
+
 async def slot_name_for_game_autocomplete(ctx: discord.AutocompleteContext):
     game_name = ctx.options.get("game_name")
 
@@ -115,6 +135,44 @@ async def slot_name_for_game_autocomplete(ctx: discord.AutocompleteContext):
     return [name for name in slot_names if name.startswith(ctx.value)]
 
 
+async def slot_name_for_assigned_game_autocomplete(ctx: discord.AutocompleteContext):
+    # Get the user's ID
+    author_id = str(ctx.interaction.user.id)
+    # Ensure the data directory exists
+    os.makedirs("data", exist_ok=True)
+    listeners_file_json = os.path.join("data", "listeners.json")
+
+    # Load the listeners file
+    try:
+        with open(listeners_file_json, "r") as f:
+            listeners_data = json.load(f)
+    except json.JSONDecodeError:
+        listeners_data = {}
+
+    # If the user has no assignments, return an empty list
+    if author_id not in listeners_data:
+        return []
+
+    # Get all assignments for the user
+    assignments = listeners_data[author_id]
+    # Get the game name from the command options; it must be provided on your slash command.
+    game_name = ctx.options.get("game_name")
+
+    # Filter assignments to only those matching the specified game (case-insensitive)
+    filtered_assignments = [
+        assignment for assignment in assignments
+        if assignment.get("game", "").lower() == game_name.lower()
+    ]
+
+    # Extract slot names from the filtered assignments (ignoring missing names)
+    slot_names = [assignment.get("slot_name") for assignment in filtered_assignments if assignment.get("slot_name")]
+
+    # Filter suggestions based on the current autocomplete input (case-insensitive prefix match)
+    current_input = ctx.value or ""
+    suggestions = [name for name in slot_names if name.lower().startswith(current_input.lower())]
+    return suggestions
+
+
 @bot.slash_command(description="Enter the server address, the bot's slot name, and the password to connect to a server.")
 @option("server_address", description="Enter the server address and port.", required = True)
 @option("slot_name", description="Enter the bot's slot name.", required = True)
@@ -123,7 +181,6 @@ async def get_server_data(ctx, server_address: str, slot_name: str, password: st
     initial_response = await ctx.respond("Connecting to server...")
     await ap_connector.main(initial_response, server_address, slot_name, password)
     await initial_response.edit_original_response(ap_connector.is_websocket_connected)
-
 
 
 @bot.slash_command(description="Assign your discord account to a slot name.")
@@ -159,7 +216,8 @@ async def assign_slot(ctx, slot_name: str):
         "slot_number": slot_number,
         "slot_name": slot_entry.get("slot_name"),
         "game": game_name,
-        "items": []  # list to hold the items the user is tracking
+        "tracked_items": [],  # list to hold the items the user is tracking
+        "items": []
     }
 
     author_id = str(ctx.author.id)
@@ -207,10 +265,9 @@ async def assign_slot(ctx, slot_name: str):
     outfile.close()
 
 
-
-@bot.slash_command(description="Get a DM with a list of items received for a slot.")
+@bot.slash_command(description="Get a DM with a list of all items received for a slot.")
 @option("slot_name", description="Enter your slot name.", autocomplete = slot_name_autocomplete, required=True)
-async def get_items(ctx, slot_name: str):
+async def get_items_for_slot(ctx, slot_name: str):
     # Send an initial ephemeral response to indicate processing.
     initial_response = await ctx.respond(content="Getting items...", ephemeral=True)
 
@@ -243,6 +300,223 @@ async def get_items(ctx, slot_name: str):
         )
 
 
+@bot.slash_command(description="Get a DM with only the new items received for your assigned games.")
+async def get_all_new_items(ctx):
+    listeners_file = os.path.join("data", "listeners.json")
+    items_received_file = os.path.join("data", "items_received.json")
+
+    # Load listeners data.
+    if not os.path.exists(listeners_file):
+        await ctx.respond("You have no assignments.", ephemeral=True)
+        return
+    with open(listeners_file, "r") as f:
+        try:
+            listeners_data = json.load(f)
+        except json.JSONDecodeError:
+            await ctx.respond("Error reading listeners file.", ephemeral=True)
+            return
+
+    author_id = str(ctx.author.id)
+    if author_id not in listeners_data:
+        await ctx.respond("You have no assignments.", ephemeral=True)
+        return
+
+    # Load items_received data.
+    if not os.path.exists(items_received_file):
+        await ctx.respond("No items received data available.", ephemeral=True)
+        return
+    with open(items_received_file, "r") as f:
+        try:
+            items_received = json.load(f)
+        except json.JSONDecodeError:
+            await ctx.respond("Error reading items received file.", ephemeral=True)
+            return
+
+    diff_message_lines = []
+    updated = False
+    assignments = listeners_data[author_id]
+
+    for assignment in assignments:
+        slot_name = assignment.get("slot_name", "Unknown")
+        # Locate the corresponding slot data in items_received.
+        slot_data = None
+        for slot_num, slot_entry in items_received.items():
+            if slot_name in slot_entry:
+                slot_data = slot_entry[slot_name]
+                break
+        if slot_data is None:
+            continue
+
+        items_dict = slot_data.get("Items", {})
+        agg_new = {}
+        if isinstance(items_dict, dict):
+            for key, item_info in items_dict.items():
+                name = item_info.get("item_name", "Unknown")
+                try:
+                    count = int(item_info.get("amount", 0))
+                except Exception:
+                    count = 0
+                agg_new[name] = agg_new.get(name, 0) + count
+
+        # "seen" items are stored under the "items" key in the assignment.
+        seen_items = assignment.get("items", {})
+        if not isinstance(seen_items, dict):
+            seen_items = {}
+
+        diff_items = {}
+        for item_name, new_total in agg_new.items():
+            seen_total = seen_items.get(item_name, 0)
+            if new_total > seen_total:
+                diff_items[item_name] = new_total - seen_total
+
+        if diff_items:
+            # Underline the slot name using ANSI escape sequences
+            underline_start = "[4;2m"
+            underline_end = "[0m"
+
+            header = f"{underline_start}Items received for {slot_name}:{underline_end}"
+
+            diff_message_lines.append(header)
+            for item_name, diff_amount in diff_items.items():
+                diff_message_lines.append(f"{item_name} +{diff_amount}")
+            diff_message_lines.append("")  # blank line for separation
+            # Update seen items to the current aggregated totals.
+            for item_name, new_total in agg_new.items():
+                seen_items[item_name] = new_total
+            assignment["items"] = seen_items
+            updated = True
+
+    if updated:
+        with open(listeners_file, "w") as f:
+            json.dump(listeners_data, f, indent=4)
+
+    if not diff_message_lines:
+        diff_message = "No new items received."
+    else:
+        diff_message = "\n".join(diff_message_lines)
+
+    # Chunk the diff message.
+    wrapper_length = len("```ansi\n") + len("\n```")
+    max_message_length = 2000 - wrapper_length
+    chunks = chunk_text_by_line(diff_message, max_message_length)
+
+    await ctx.respond("I've sent you a DM with your new items for all your assigned games.", ephemeral=True)
+    try:
+        for chunk in chunks:
+            await ctx.author.send(f"```ansi\n{chunk}\n```")
+    except discord.Forbidden:
+        await ctx.respond("I couldn't send you a DM. Please check your DM settings.", ephemeral=True)
+
+
+@bot.slash_command(description="Get a DM with new items received for a specified slot.")
+@option("slot_name", description="Enter your slot name.", autocomplete = slot_name_for_assigned_slot_autocomplete, required=True)
+async def get_new_items_for_slot(ctx, slot_name: str):
+    listeners_file = os.path.join("data", "listeners.json")
+    items_received_file = os.path.join("data", "items_received.json")
+
+    # Load listeners data.
+    if not os.path.exists(listeners_file):
+        await ctx.respond("You have no assignments.", ephemeral=True)
+        return
+    with open(listeners_file, "r") as f:
+        try:
+            listeners_data = json.load(f)
+        except json.JSONDecodeError:
+            await ctx.respond("Error reading listeners file.", ephemeral=True)
+            return
+
+    author_id = str(ctx.author.id)
+    if author_id not in listeners_data:
+        await ctx.respond("You have no assignments.", ephemeral=True)
+        return
+
+    # Load items_received data.
+    if not os.path.exists(items_received_file):
+        await ctx.respond("No items received data available.", ephemeral=True)
+        return
+    with open(items_received_file, "r") as f:
+        try:
+            items_received = json.load(f)
+        except json.JSONDecodeError:
+            await ctx.respond("Error reading items received file.", ephemeral=True)
+            return
+
+    diff_message_lines = []
+    updated = False
+    assignments = listeners_data[author_id]
+    for assignment in assignments:
+        assigned_slot = assignment.get("slot_name", "")
+        if assigned_slot.lower() != slot_name.lower():
+            continue
+
+        # Locate the corresponding slot data in items_received.
+        slot_data = None
+        for slot_num, slot_entry in items_received.items():
+            if assigned_slot in slot_entry:
+                slot_data = slot_entry[assigned_slot]
+                break
+        if slot_data is None:
+            continue
+
+        items_dict = slot_data.get("Items", {})
+        agg_new = {}
+        if isinstance(items_dict, dict):
+            for key, item_info in items_dict.items():
+                name = item_info.get("item_name", "Unknown")
+                try:
+                    count = int(item_info.get("amount", 0))
+                except Exception:
+                    count = 0
+                agg_new[name] = agg_new.get(name, 0) + count
+
+        seen_items = assignment.get("items", {})
+        if not isinstance(seen_items, dict):
+            seen_items = {}
+
+        diff_items = {}
+        for item_name, new_total in agg_new.items():
+            seen_total = seen_items.get(item_name, 0)
+            if new_total > seen_total:
+                diff_items[item_name] = new_total - seen_total
+
+        if diff_items:
+
+            # Underline the slot name using ANSI escape sequences
+            underline_start = "[4;2m"
+            underline_end = "[0m"
+
+            header = f"{underline_start}Items received for {slot_name}:{underline_end}"
+
+            diff_message_lines.append(header)
+            for item_name, diff_amount in diff_items.items():
+                diff_message_lines.append(f"{item_name} +{diff_amount}")
+            diff_message_lines.append("")
+            for item_name, new_total in agg_new.items():
+                seen_items[item_name] = new_total
+            assignment["items"] = seen_items
+            updated = True
+
+    if updated:
+        with open(listeners_file, "w") as f:
+            json.dump(listeners_data, f, indent=4)
+
+    if not diff_message_lines:
+        diff_message = f"No new items received for {slot_name}."
+    else:
+        diff_message = "\n".join(diff_message_lines)
+
+    wrapper_length = len("```ansi\n") + len("\n```")
+    max_message_length = 2000 - wrapper_length
+    chunks = chunk_text_by_line(diff_message, max_message_length)
+
+    await ctx.respond("I've sent you a DM with your new items for the specified slot.", ephemeral=True)
+    try:
+        for chunk in chunks:
+            await ctx.author.send(f"```ansi\n{chunk}\n```")
+    except discord.Forbidden:
+        await ctx.respond("I couldn't send you a DM. Please check your DM settings.", ephemeral=True)
+
+
 # Helper function to split text into chunks without breaking lines
 def chunk_text_by_line(content, max_length):
     """
@@ -264,6 +538,7 @@ def chunk_text_by_line(content, max_length):
     if current_chunk:
         chunks.append(current_chunk)
     return chunks
+
 
 # Updated send_items: searches for the assignment's slot in the new items_received.json format,
 # and builds a plain-text message listing the items and their amounts.
@@ -294,8 +569,6 @@ async def send_items(ctx, assignment, initial_response):
         message = f"No items found for slot: {slot_name}"
         return message
 
-    # Extract game name (from data) and the items dictionary
-    game_name_in_data = slot_data.get("Game Name", "Unknown")
     items_dict = slot_data.get("Items", {})
 
     # Underline the slot name using ANSI escape sequences
@@ -319,22 +592,34 @@ async def send_items(ctx, assignment, initial_response):
     return message
 
 
-# Helper function to format the diff dictionary into a message string.
 def format_diff_message(diff):
     lines = []
     for slot, slot_data in diff.items():
         for slot_name, details in slot_data.items():
-            lines.append(f"New items received for {slot_name}:")
+
+            # Underline the slot name using ANSI escape sequences
+            underline_start = "[4;2m"
+            underline_end = "[0m"
+            header = f"{underline_start}Items received for {slot_name}:{underline_end}"
+            lines.append(header)
+
+            # Add a game completion message if the game status changed to completed.
+            if "Game Completed" in details:
+                lines.append(f"Game Completed: {details['Game Completed']}")
+
             new_items = details.get("New Items", {})
             for item_name, change in new_items.items():
                 lines.append(f"{item_name} +{change}")
+
             lines.append("")  # blank line for separation
     return "\n".join(lines)
+
 
 async def no_dm_tracker(tracker_url, auth):
     while True:
         await tracker_download.get_all_tracker_received_items(tracker_url, auth)
         await asyncio.sleep(60)
+
 
 # Loop function to check for changes every 60 seconds and send a DM to a specific channel.
 async def check_for_item_changes(tracker_url, auth, channel_id):
@@ -423,7 +708,7 @@ async def get_all_tracked_items(ctx):
 @bot.slash_command(description="Enter the name of an item blocking your progress to get a DM when that item is found.")
 @option('game_name', description="Enter the name of the game.", autocomplete=game_name_autocomplete, required=True)
 @option("item_name", description="Enter the name of the item.", autocomplete=items_autocomplete, required=True)
-@option("slot_name", description="Enter your slot name.", autocomplete=slot_name_for_game_autocomplete, required=True)
+@option("slot_name", description="Enter your slot name.", autocomplete=slot_name_for_assigned_game_autocomplete, required=True)
 @option("target_amount", description="Enter the number of items you are tracking for.", required=True)
 async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target_amount: int):
     initial_response = await ctx.respond("tracking item...", ephemeral=True)
@@ -464,19 +749,19 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
         )
         return
 
-    # Ensure the assignment has an "items" dictionary to store tracked items
-    if "items" not in matching_assignment:
-        matching_assignment["items"] = {}
+    # Ensure the assignment has a "tracked_items" dictionary to store tracked items
+    if "tracked_items" not in matching_assignment:
+        matching_assignment["tracked_items"] = {}
 
     # Check if the item is already being tracked
-    if item_name in matching_assignment["items"]:
+    if item_name in matching_assignment["tracked_items"]:
         await initial_response.edit_original_response(
             content=f"**{item_name}** is already being tracked for **{game_name}** under slot **{slot_name}**."
         )
         return
 
     # Add the new item to track with its target amount and initial count of 0
-    matching_assignment["items"][item_name] = {"target": target_amount, "current": 0}
+    matching_assignment["tracked_items"][item_name] = {"target": target_amount, "current": 0}
 
     # Save the updated listeners data back to file
     with open(listeners_data_json, "w") as f:
@@ -485,7 +770,6 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
     await initial_response.edit_original_response(
         content=f"Now tracking **{item_name}** (target: {target_amount}) for **{game_name}** under slot **{slot_name}**."
     )
-
 
 
 async def check_tracked_items_loop():
@@ -523,7 +807,7 @@ async def check_tracked_items_loop():
             user_messages = []  # Collect messages for the user across assignments
             for assignment in assignments:
                 slot_name = assignment.get("slot_name")
-                tracked_items = assignment.get("items", {})
+                tracked_items = assignment.get("tracked_items", {})
 
                 # If tracked_items is a list (from an older structure), convert it to a dictionary.
                 if isinstance(tracked_items, list):
@@ -531,15 +815,10 @@ async def check_tracked_items_loop():
                     for item in tracked_items:
                         # Set a default target amount of 1 (or adjust as needed)
                         new_tracked[item] = {"target": 1, "current": 0}
-                    assignment["items"] = new_tracked
+                    assignment["tracked_items"] = new_tracked
                     tracked_items = new_tracked
 
                 # Find the corresponding slot in items_received.json.
-                # Expected structure of items_received:
-                # {
-                #     "1": { "Slot A": { "Game Name": "Game A", "Items": { "1": {"item_name": "Item A", "amount": 2}, ... } } },
-                #     ...
-                # }
                 slot_items_data = None
                 for slot_num, slot_data in items_received.items():
                     if slot_name in slot_data:

@@ -372,7 +372,3 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
             print(f"Unexpected error: {e}")
             is_websocket_connected = False
             break
-
-
-        print("System item tracker will only send messages to users tracking items.")
-        bot.loop.create_task(no_dm_tracker(tracker_url, auth))
