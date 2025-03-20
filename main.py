@@ -642,7 +642,7 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
             max_content_length = 2000 - wrapper_length
             chunks = chunk_text_by_line(message, max_content_length)
             for chunk in chunks:
-                await channel.send(f"```\n{chunk}\n```")
+                await channel.send(f"```ansi\n{chunk}\n```")
         else:
             print("No changes found.")
 
