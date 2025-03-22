@@ -216,8 +216,8 @@ async def assign_slot(ctx, slot_name: str):
         "slot_number": slot_number,
         "slot_name": slot_entry.get("slot_name"),
         "game": game_name,
-        "tracked_items": [],  # list to hold the items the user is tracking
-        "items": []
+        "items": [],  # list to hold the items the user is tracking
+        "tracked_items": []
     }
 
     author_id = str(ctx.author.id)
@@ -757,21 +757,27 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
 
     # Check if the item is already being tracked
     if item_name in matching_assignment["tracked_items"]:
+        if "target" in matching_assignment["tracked_items"][item_name] == target_amount:
+            await initial_response.edit_original_response(
+                content=f"**{item_name}** is already being tracked for **{game_name}** under slot **{slot_name}**.  Current amount: {matching_assignment['tracked_items'][item_name]['current']}."
+            )
+            return
+        elif "target" in matching_assignment["tracked_items"][item_name] != target_amount:
+            await initial_response.edit_original_response(
+                content=f"Now tracking **{item_name}** (target: {target_amount} for **{game_name}** under slot **{slot_name}**.  Current amount: {matching_assignment['tracked_items'][item_name]['current']}."
+            )
+            matching_assignment["tracked_items"][item_name] = {"target": target_amount, "current": {matching_assignment['tracked_items'][item_name]['current']}}
+    else:
+        # Add the new item to track with its target amount and initial count of 0
+        matching_assignment["tracked_items"][item_name] = {"target": target_amount, "current": 0}
+
+        # Save the updated listeners data back to file
+        with open(listeners_data_json, "w") as f:
+            json.dump(listeners_data, f, indent=4)
+
         await initial_response.edit_original_response(
-            content=f"**{item_name}** is already being tracked for **{game_name}** under slot **{slot_name}**."
+            content=f"Now tracking **{item_name}** (target: {target_amount}) for **{game_name}** under slot **{slot_name}**."
         )
-        return
-
-    # Add the new item to track with its target amount and initial count of 0
-    matching_assignment["tracked_items"][item_name] = {"target": target_amount, "current": 0}
-
-    # Save the updated listeners data back to file
-    with open(listeners_data_json, "w") as f:
-        json.dump(listeners_data, f, indent=4)
-
-    await initial_response.edit_original_response(
-        content=f"Now tracking **{item_name}** (target: {target_amount}) for **{game_name}** under slot **{slot_name}**."
-    )
 
 
 async def check_tracked_items_loop():
