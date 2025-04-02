@@ -1,3 +1,5 @@
+import time
+
 import discord
 from discord.ext import commands, tasks
 from discord import option
@@ -594,18 +596,20 @@ async def send_items(ctx, assignment, initial_response):
 
 def format_diff_message(diff):
     lines = []
+
+    # Underline the slot name using ANSI escape sequences
+    underline_start = "[4;2m"
+    underline_end = "[0m"
+
     for slot, slot_data in diff.items():
         for slot_name, details in slot_data.items():
 
             # Add a game completion message if the game status changed to completed.
             if "Goal Completed" in details:
-                lines.append(f"{slot_name} Goal Completed!  All items released.")
+                lines.append(f"{underline_start}{slot_name} Goal Completed!  All items released.{underline_end}")
 
             else:
 
-                # Underline the slot name using ANSI escape sequences
-                underline_start = "[4;2m"
-                underline_end = "[0m"
                 header = f"{underline_start}Items received for {slot_name}:{underline_end}"
                 lines.append(header)
 
@@ -634,7 +638,9 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
     while not bot.is_closed():
         # Get the new diff from tracker data.
         diff = tracker_download.get_all_tracker_received_items(tracker_url, auth)
+        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         if diff:
+            print(f"Changes found at {current_time}")
             message = format_diff_message(diff)
             # Prepare to send the message in a code block.
             # Adjust the maximum content length to account for the code block wrappers.
@@ -644,7 +650,7 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
             for chunk in chunks:
                 await channel.send(f"```ansi\n{chunk}\n```")
         else:
-            print("No changes found.")
+            print(f"No changes found at {current_time}")
 
         # Wait 60 seconds before checking again.
         await asyncio.sleep(60)
@@ -764,7 +770,7 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
             return
         elif "target" in matching_assignment["tracked_items"][item_name] != target_amount:
             await initial_response.edit_original_response(
-                content=f"Now tracking **{item_name}** (target: {target_amount} for **{game_name}** under slot **{slot_name}**.  Current amount: {matching_assignment['tracked_items'][item_name]['current']}."
+                content=f"Now tracking **{item_name}** (target: {target_amount}) for **{game_name}** under slot **{slot_name}**.  Current amount: {matching_assignment['tracked_items'][item_name]['current']}."
             )
             matching_assignment["tracked_items"][item_name] = {"target": target_amount, "current": {matching_assignment['tracked_items'][item_name]['current']}}
     else:
