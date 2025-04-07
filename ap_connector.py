@@ -84,52 +84,66 @@ async def send(websocket, payload):
 
 
 # Get the items for the given slot
-async def get_data_package(websocket, games):
+async def get_data_package(websocket, game):
     payload = [{
         'cmd': 'GetDataPackage',
-        'games': games
+        'games': [game]
     }]
     await send(websocket, payload)
 
 
 # Process data packages
 async def process_data_package(data_package):
-
-    # print(f"Processing data package: {data_package}")
     # Extract the games dictionary; if missing, use an empty dict.
-    games = data_package.get('games', {})
-    result = []
+    new_games = data_package.get('games', {})
+    if not new_games:
+        return []
 
-    # Iterate over the sorted game names
-    for game_name in sorted(games.keys()):
-        game_data = games[game_name]
+    # Define the path for our data file
+    os.makedirs("data", exist_ok=True)
+    data_package_json = os.path.join("data", "data_package.json")
+
+    # Load existing data if it exists
+    if os.path.exists(data_package_json):
+        with open(data_package_json, "r") as f:
+            try:
+                existing_data = json.load(f)
+            except json.JSONDecodeError:
+                existing_data = []
+    else:
+        existing_data = []
+
+    # Convert existing data to a dictionary for easy access
+    existing_games_dict = {entry["game"]: entry for entry in existing_data}
+
+    # Process new games
+    for game_name, game_data in new_games.items():
+        if game_name in existing_games_dict:
+            continue  # Skip if the game already exists
 
         # Get items and locations; default to empty dicts if keys are missing.
-        items = game_data.get('item_name_to_id', {})
-        locations = game_data.get('location_name_to_id', {})
+        items = game_data.get("item_name_to_id", {})
+        locations = game_data.get("location_name_to_id", {})
 
         # Sort the inner dictionaries by key (optional)
         sorted_items = dict(sorted(items.items()))
         sorted_locations = dict(sorted(locations.items()))
 
-        # Append the formatted game data to the result list
-        result.append({
+        # Add new game entry to the dictionary
+        existing_games_dict[game_name] = {
             "game": game_name,
             "item_name_to_id": sorted_items,
             "location_name_to_id": sorted_locations
-        })
-    json_result = json.dumps(result, indent=4)
+        }
 
-    os.makedirs("data", exist_ok=True)
-    data_package_json = os.path.join("data", "data_package.json")
-    # Write the processed data package to data_package.json
+    # Convert back to a list for JSON output
+    updated_data = list(existing_games_dict.values())
+
+    # Save the updated data back to the file
     with open(data_package_json, "w") as outfile:
-        outfile.write(json_result)
+        json.dump(updated_data, outfile, indent=4)
 
-    outfile.close()
-
-    # print(json_result)
-    return result
+    return updated_data
 
 
 async def build_reverse_data_package_mapping(data_package):
@@ -201,15 +215,14 @@ async def read_response():
                 print("Got room info packet")
                 print(msg)
                 games_in_server = msg.get("games", {})
-                await get_data_package(websocket, games_in_server)
+                for game in games_in_server:
+                    print(f"Getting data package for {game}")
+                    await get_data_package(websocket, game)
 
             elif msg.get("cmd") == "DataPackage":
                 print("Got a data package")
 
                 main.data_package_mapping = await process_data_package(msg["data"])
-
-                # close the connection
-                time.sleep(5)
 
             elif msg.get("cmd") == "PrintJSON":
                 if msg.get("type") == "ItemSend":

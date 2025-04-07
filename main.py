@@ -284,7 +284,7 @@ async def get_items_for_slot(ctx, slot_name: str):
 
     # Use plain code block formatting (without "ansi").
     wrapper_length = len("``ansi`\n") + len("\n```")
-    max_content_length = 2000 - wrapper_length
+    max_content_length = 1950 - wrapper_length
 
     # Break the message into chunks that fit within Discord's limits.
     chunks = chunk_text_by_line(message, max_content_length)
@@ -399,7 +399,7 @@ async def get_all_new_items(ctx):
 
     # Chunk the diff message.
     wrapper_length = len("```ansi\n") + len("\n```")
-    max_message_length = 2000 - wrapper_length
+    max_message_length = 1950 - wrapper_length
     chunks = chunk_text_by_line(diff_message, max_message_length)
 
     await ctx.respond("I've sent you a DM with your new items for all your assigned games.", ephemeral=True)
@@ -508,7 +508,7 @@ async def get_new_items_for_slot(ctx, slot_name: str):
         diff_message = "\n".join(diff_message_lines)
 
     wrapper_length = len("```ansi\n") + len("\n```")
-    max_message_length = 2000 - wrapper_length
+    max_message_length = 1950 - wrapper_length
     chunks = chunk_text_by_line(diff_message, max_message_length)
 
     await ctx.respond("I've sent you a DM with your new items for the specified slot.", ephemeral=True)
@@ -645,7 +645,7 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
             # Prepare to send the message in a code block.
             # Adjust the maximum content length to account for the code block wrappers.
             wrapper_length = len("```\n") + len("\n```")
-            max_content_length = 2000 - wrapper_length
+            max_content_length = 1950 - wrapper_length
             chunks = chunk_text_by_line(message, max_content_length)
             for chunk in chunks:
                 await channel.send(f"```ansi\n{chunk}\n```")
@@ -696,7 +696,7 @@ async def get_all_tracked_items(ctx):
 
     # Prepare the message for DM; use plain text code blocks.
     wrapper_length = len("```ansi\n") + len("\n```")
-    max_content_length = 2000 - wrapper_length
+    max_content_length = 1950 - wrapper_length
     chunks = chunk_text_by_line(combined_message, max_content_length)
 
 
