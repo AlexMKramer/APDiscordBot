@@ -67,7 +67,7 @@ async def game_name_autocomplete(ctx: discord.AutocompleteContext):
     for entry in data_package:
         game_name = entry.get("game")
         game_names.append(game_name)
-    return [game_name for game_name in game_names if game_name.startswith(ctx.value)]
+    return [game_name for game_name in sorted(game_names) if game_name.lower().startswith(ctx.value.lower())]
 
 
 async def items_autocomplete(ctx: discord.AutocompleteContext):
@@ -91,10 +91,10 @@ async def items_autocomplete(ctx: discord.AutocompleteContext):
         return []  # No matching game found.
 
     # Get the list of item names from the game data
-    item_names = list(game_data.get("item_name_to_id", {}).keys())
+    item_names = sorted(list(game_data.get("item_name_to_id", {}).keys()))
     user_input = ctx.value or ""
 
-    return [name for name in item_names if name.startswith(ctx.value)]
+    return [name for name in item_names if name.lower().startswith(ctx.value.lower())]
 
 
 async def slot_name_autocomplete(ctx: discord.AutocompleteContext):
@@ -103,8 +103,8 @@ async def slot_name_autocomplete(ctx: discord.AutocompleteContext):
     slot_info_json = os.path.join("data", "slot_info.json")
     with open(slot_info_json, "r") as f:
         slot_info = json.load(f)
-    slot_names = [info.get("slot_name") for info in slot_info.values()]
-    return [name for name in slot_names if name.startswith(ctx.value)]
+    slot_names = sorted([info.get("slot_name") for info in slot_info.values()])
+    return [name for name in slot_names if name.lower().startswith(ctx.value.lower())]
 
 
 async def slot_name_for_assigned_slot_autocomplete(ctx: discord.AutocompleteContext):
@@ -121,8 +121,8 @@ async def slot_name_for_assigned_slot_autocomplete(ctx: discord.AutocompleteCont
         return []  # No assignments for this user
 
     assignments = listeners_data[author_id]
-    slot_names = [assignment.get("slot_name") for assignment in assignments]
-    return [name for name in slot_names if name.startswith(ctx.value)]
+    slot_names = sorted([assignment.get("slot_name") for assignment in assignments])
+    return [name for name in slot_names if name.lower().startswith(ctx.value.lower())]
 
 
 async def slot_name_for_game_autocomplete(ctx: discord.AutocompleteContext):
@@ -167,7 +167,7 @@ async def slot_name_for_assigned_game_autocomplete(ctx: discord.AutocompleteCont
     ]
 
     # Extract slot names from the filtered assignments (ignoring missing names)
-    slot_names = [assignment.get("slot_name") for assignment in filtered_assignments if assignment.get("slot_name")]
+    slot_names = sorted([assignment.get("slot_name") for assignment in filtered_assignments if assignment.get("slot_name")])
 
     # Filter suggestions based on the current autocomplete input (case-insensitive prefix match)
     current_input = ctx.value or ""
