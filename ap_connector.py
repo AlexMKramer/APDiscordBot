@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 from json import JSONEncoder, JSONDecoder
 import os
@@ -11,6 +12,16 @@ import websockets
 is_websocket_connected = False
 auto_reconnect = False
 packet_queue = asyncio.Queue()
+
+# One-shot data-collection progress for a get_server_data run. The bot only needs to
+# stay connected long enough to receive the slot info (the "Connected" packet) and a
+# data package for every game in the room; once it has those it disconnects (per the
+# README: "get the packets it needs, and disconnect"). These reset at the start of main().
+room_info_received = False
+connected_received = False
+expected_data_packages = 0
+received_data_packages = 0
+intentional_close = False
 
 def encode(data):
     return JSONEncoder(
@@ -170,7 +181,9 @@ async def handle_messages(discord_ack, websocket):
                 await add_packet_to_queue(discord_ack, websocket, msg)
     except websockets.exceptions.ConnectionClosed:
         is_websocket_connected = False
-        await discord_ack.edit_original_response(content="Connection was closed.")
+        # Don't clobber the success/refusal message when we closed on purpose.
+        if not intentional_close:
+            await discord_ack.edit_original_response(content="Connection was closed.")
         print("Connection was closed.")
 
 async def add_packet_to_queue(discord_ack, websocket, packet):
@@ -182,10 +195,12 @@ async def add_packet_to_queue(discord_ack, websocket, packet):
 @tasks.loop(seconds=1)
 async def read_response():
     global is_websocket_connected, auto_reconnect
+    global room_info_received, connected_received, expected_data_packages, received_data_packages, intentional_close
     try:
         if not packet_queue.empty():
             discord_ack, websocket, msg = await packet_queue.get()
             if msg.get("cmd") == "Connected":
+                connected_received = True
                 print(msg)
                 print("Connected to the server")
 
@@ -215,12 +230,16 @@ async def read_response():
                 print("Got room info packet")
                 print(msg)
                 games_in_server = msg.get("games", {})
+                room_info_received = True
+                # We request one data package per game, so expect one response each.
+                expected_data_packages = len(games_in_server)
                 for game in games_in_server:
                     print(f"Getting data package for {game}")
                     await get_data_package(websocket, game)
 
             elif msg.get("cmd") == "DataPackage":
                 print("Got a data package")
+                received_data_packages += 1
 
                 main.data_package_mapping = await process_data_package(msg["data"])
 
@@ -332,56 +351,132 @@ async def read_response():
 
 
             elif msg.get("cmd") == "ConnectionRefused":
-                refusal_reason = msg.get("error", "Unknown reason")
-                print("Connection refused. Reason:", refusal_reason)
+                # AP sends a list of error strings (e.g. ["InvalidSlot"]); fall back
+                # to the older singular field just in case.
+                errors = msg.get("errors") or msg.get("error") or ["Unknown reason"]
+                if isinstance(errors, list):
+                    reason = ", ".join(str(e) for e in errors)
+                else:
+                    reason = str(errors)
+                print("Connection refused. Reason:", reason)
+                intentional_close = True
+                await discord_ack.edit_original_response(
+                    content=f"The server refused the connection: {reason}. Check the slot name and password."
+                )
                 await disconnect(websocket)
                 is_websocket_connected = False
             elif msg.get("cmd") == "Bounced":
                 print("Boing!")
             else:
                 print(f"Received unknown packet: {msg}")
+
+            # Once we have the slot info and every game's data package, we're done.
+            await finish_data_collection_if_complete(discord_ack, websocket)
             print(f"Queue size: {packet_queue.qsize()}")
     except Exception as e:
         print(f"An error occurred while processing the packet: {e}")
         await discord_ack.edit_original_response(content=f"An error occurred while processing the packet: {e}")
 
 
+async def finish_data_collection_if_complete(discord_ack, websocket):
+    """Disconnect once the bot has everything a get_server_data run needs: the slot
+    info from the Connected packet and a data package for every game in the room."""
+    global intentional_close
+    if intentional_close:
+        return
+    if not (room_info_received and connected_received):
+        return
+    if received_data_packages < expected_data_packages:
+        return
+
+    intentional_close = True
+    await discord_ack.edit_original_response(
+        content=f"Collected all server data ({received_data_packages} game data package(s)). "
+                f"Disconnecting -- you can now use the other commands."
+    )
+    await disconnect(websocket)
+
+
 
 async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bot", password=""):
 
-    data_package_mapping = []
-    reverse_item = {}
-    reverse_location = {}
-    players_mapping = {}
-    player_received_items = {}
-
     global is_websocket_connected, auto_reconnect
+    global room_info_received, connected_received, expected_data_packages, received_data_packages, intentional_close
     auto_reconnect = False
 
-    while True:
-        try:
-            async with websockets.connect(f"ws://{address}") as websocket:
-                is_websocket_connected = True
-                # Send initial connection payload
-                await send_connect_packet(websocket, slot_name, password)
+    # Reset one-shot data-collection progress for this run.
+    room_info_received = False
+    connected_received = False
+    expected_data_packages = 0
+    received_data_packages = 0
+    intentional_close = False
 
-                # Run tasks concurrently; these will stop if the connection closes or an error occurs.
-                await asyncio.gather(
-                    handle_messages(discord_ack, websocket),
-                    read_response.start(),
-                    send_hello(websocket),
-                    check_connection(websocket, slot_name, password)
-                )
-        except websockets.ConnectionClosed:
-            print("Websocket connection closed.")
-            is_websocket_connected = False
-            # If auto_reconnect is not enabled, break out of the loop.
-            if not auto_reconnect:
+    # Normalize the address: trim whitespace and strip any scheme the user pasted
+    # (e.g. "https://host:port" -> "host:port") so we don't build "ws://https://...",
+    # which would make the resolver try to look up a host literally named "https".
+    cleaned = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", address.strip())
+
+    # read_response is a persistent tasks.loop that drains the shared packet queue.
+    # Start it once -- starting an already-running loop raises RuntimeError, which
+    # would otherwise blow up the second time get_server_data is invoked.
+    if not read_response.is_running():
+        read_response.start()
+
+    # Prefer a plaintext (ws://) connection, but fall back to TLS (wss://) when the
+    # server speaks TLS to our handshake (raising InvalidMessage: "did not receive a
+    # valid HTTP response"). Servers behind a reverse proxy commonly require wss://.
+    schemes = ["ws", "wss"]
+
+    while True:
+        connection_error = None
+
+        for scheme in schemes:
+            uri = f"{scheme}://{cleaned}"
+            try:
+                async with websockets.connect(uri) as websocket:
+                    print(f"Connected to {uri}")
+                    schemes = [scheme]  # pin the working scheme for any reconnects
+                    is_websocket_connected = True
+                    # Send initial connection payload
+                    await send_connect_packet(websocket, slot_name, password)
+
+                    # Run tasks concurrently; these stop when the connection closes.
+                    await asyncio.gather(
+                        handle_messages(discord_ack, websocket),
+                        send_hello(websocket),
+                        check_connection(websocket, slot_name, password)
+                    )
+                # The session ended (socket closed); stop trying other schemes.
+                connection_error = None
                 break
-            else:
-                print("Attempting to reconnect in 5 seconds...")
-                await asyncio.sleep(5)
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            is_websocket_connected = False
+            except websockets.InvalidMessage:
+                # Handshake wasn't valid HTTP -- usually a scheme mismatch, e.g. a
+                # plaintext ws:// handshake against a TLS-only endpoint. Try the next.
+                print(f"{scheme}:// handshake failed; trying the next scheme.")
+                connection_error = "handshake failed"
+                continue
+            except websockets.ConnectionClosed:
+                print("Websocket connection closed.")
+                is_websocket_connected = False
+                connection_error = None
+                break
+            except Exception as e:
+                print(f"Failed to connect via {scheme}://: {e}")
+                connection_error = e
+                continue
+
+        is_websocket_connected = False
+
+        if connection_error is not None:
+            # Every scheme failed to establish a connection.
+            await discord_ack.edit_original_response(
+                content="Could not connect to the server. Double-check the address and port, then try again."
+            )
             break
+
+        # The connection closed cleanly. Reconnect only if it was requested.
+        if not auto_reconnect:
+            break
+
+        print("Attempting to reconnect in 5 seconds...")
+        await asyncio.sleep(5)

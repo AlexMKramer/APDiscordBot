@@ -7,6 +7,7 @@ import asyncio
 import dotenv
 import os
 import datetime
+import fnmatch
 import ap_connector
 import json
 import tracker_download
@@ -181,50 +182,64 @@ async def slot_name_for_assigned_game_autocomplete(ctx: discord.AutocompleteCont
 @option("password", description="Enter the server password.", required = False)
 async def get_server_data(ctx, server_address: str, slot_name: str, password: str = None):
     initial_response = await ctx.respond("Connecting to server...")
-    await ap_connector.main(initial_response, server_address, slot_name, password)
-    await initial_response.edit_original_response(ap_connector.is_websocket_connected)
+
+    # ap_connector.main runs the websocket session, which stays open while connected.
+    # Launch it in the background instead of awaiting it here -- awaiting would block
+    # the command callback forever. The connector edits initial_response itself to
+    # report "Connected to the server" or any error.
+    async def run_connection():
+        try:
+            await ap_connector.main(initial_response, server_address, slot_name, password)
+        except Exception as e:
+            try:
+                await initial_response.edit_original_response(content=f"Failed to connect: {e}")
+            except Exception:
+                pass
+
+    bot.loop.create_task(run_connection())
 
 
-@bot.slash_command(description="Assign your discord account to a slot name.")
-@option("slot_name", description="Enter your slot name.", autocomplete = slot_name_autocomplete, required=True)
+@bot.slash_command(description="Assign your discord account to a slot name. Use * as a wildcard to assign several at once.")
+@option("slot_name", description="A slot name, or a wildcard like Alex_* to assign every matching slot.", autocomplete = slot_name_autocomplete, required=True)
 async def assign_slot(ctx, slot_name: str):
     initial_response = await ctx.respond("Assigning slot name...", ephemeral=True)
 
+    pattern = slot_name.strip()
+
     os.makedirs("data", exist_ok=True)
     slot_info_json = os.path.join("data", "slot_info.json")
-    with open(slot_info_json, "r") as f:
-        slot_info = json.load(f)
-
-    # Look for the slot entry by matching the slot_name (case-insensitive)
-    slot_entry = None
-    slot_number = None
-    for key, info in slot_info.items():
-        if info.get("slot_name", "").lower() == slot_name.lower():
-            slot_entry = info
-            slot_number = key
-            break
-
-    if slot_entry is None:
+    try:
+        with open(slot_info_json, "r") as f:
+            slot_info = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
         await initial_response.edit_original_response(
-            content=f"{slot_name} not found. Check spelling and try again."
+            content="No server data found yet. Run /get_server_data first."
         )
         return
 
-    # Extract game name from the slot entry
-    game_name = slot_entry.get("game", "Unknown")
+    # If the input contains wildcard characters, match every slot against it;
+    # otherwise look for a single exact (case-insensitive) match, as before.
+    is_wildcard = any(ch in pattern for ch in "*?[")
+    matched_slots = []  # list of (slot_number, info)
+    for key, info in slot_info.items():
+        name = info.get("slot_name", "")
+        if is_wildcard:
+            if fnmatch.fnmatchcase(name.lower(), pattern.lower()):
+                matched_slots.append((key, info))
+        elif name.lower() == pattern.lower():
+            matched_slots.append((key, info))
+            break
 
-    # Prepare the assignment dictionary with slot number, slot name, game, and an empty list of items
-    new_assignment = {
-        "slot_number": slot_number,
-        "slot_name": slot_entry.get("slot_name"),
-        "game": game_name,
-        "items": [],  # list to hold the items the user is tracking
-        "tracked_items": []
-    }
+    if not matched_slots:
+        if is_wildcard:
+            message = f"No slots matched the pattern `{pattern}`. Try a different wildcard."
+        else:
+            message = f"{pattern} not found. Check spelling and try again."
+        await initial_response.edit_original_response(content=message)
+        return
 
     author_id = str(ctx.author.id)
 
-    os.makedirs("data", exist_ok=True)
     listeners_file_json = os.path.join("data", "listeners.json")
 
     # Load existing listeners data or initialize an empty dictionary
@@ -237,34 +252,56 @@ async def assign_slot(ctx, slot_name: str):
     else:
         listeners_data = {}
 
-    # Update the listeners data for this author.
-    # Listeners_data will store a list of assignment dictionaries for each author.
-    if author_id in listeners_data:
-        # Check if the same slot is already assigned
-        assignments = listeners_data[author_id]
-        already_assigned = any(
-            assignment.get("slot_name", "").lower() == slot_name.lower() for assignment in assignments
-        )
-        if already_assigned:
-            await initial_response.edit_original_response(
-                content=f"{slot_name} is already assigned to you."
-            )
-        else:
-            assignments.append(new_assignment)
-            await initial_response.edit_original_response(
-                content=f"Assigned {slot_name} ({game_name}) to you."
-            )
-    else:
-        listeners_data[author_id] = [new_assignment]
-        await initial_response.edit_original_response(
-            content=f"Assigned {slot_name} ({game_name}) to you."
-        )
+    # Each author maps to a list of assignment dictionaries.
+    assignments = listeners_data.setdefault(author_id, [])
+    existing_names = {a.get("slot_name", "").lower() for a in assignments}
+
+    newly_assigned = []
+    skipped = []
+    for slot_number, info in matched_slots:
+        name = info.get("slot_name")
+        game_name = info.get("game", "Unknown")
+        if name.lower() in existing_names:
+            skipped.append(name)
+            continue
+        assignments.append({
+            "slot_number": slot_number,
+            "slot_name": name,
+            "game": game_name,
+            "items": [],  # list to hold the items the user is tracking
+            "tracked_items": []
+        })
+        existing_names.add(name.lower())
+        newly_assigned.append(name)
 
     # Save the updated listeners data back to listeners.json
     with open(listeners_file_json, "w") as outfile:
         json.dump(listeners_data, outfile, indent=4)
 
-    outfile.close()
+    # Build a result message.
+    lines = []
+    if newly_assigned:
+        if len(newly_assigned) == 1:
+            lines.append(f"Assigned **{newly_assigned[0]}** to you.")
+        else:
+            lines.append(f"Assigned **{len(newly_assigned)}** slots to you:")
+            lines.extend(f"• {name}" for name in newly_assigned)
+    if skipped:
+        lines.append(f"Already assigned ({len(skipped)}): {', '.join(skipped)}")
+    if not newly_assigned and not skipped:
+        lines.append("No slots assigned.")
+
+    content = "\n".join(lines)
+    # Stay under Discord's 2000-character message limit for large wildcard matches.
+    if len(content) > 1900:
+        parts = []
+        if newly_assigned:
+            parts.append(f"Assigned {len(newly_assigned)} slots to you.")
+        if skipped:
+            parts.append(f"{len(skipped)} were already assigned.")
+        content = " ".join(parts)
+
+    await initial_response.edit_original_response(content=content)
 
 
 @bot.slash_command(description="Get a DM with a list of all items received for a slot.")
