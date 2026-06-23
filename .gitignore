@@ -49,3 +49,7 @@ slot_info.json
 # Python bytecode
 __pycache__/
 *.pyc
+
+# go-mode: host-provided apworlds (large binaries; like /data, not committed -- only the README)
+/apworlds/*
+!/apworlds/README.md

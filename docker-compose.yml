@@ -7,6 +7,11 @@ services:
       - .:/app
     environment:
       - PYTHONUNBUFFERED=1
+      # Go-mode analyzer: its own AP-capable venv (built in the Dockerfile) and the host's
+      # apworlds. The apworlds live in ./apworlds, which is already inside the container at
+      # /app/apworlds via the .:/app mount above (just like ./data).
+      - GOMODE_AP_PYTHON=/opt/ap-venv/bin/python
+      - GOMODE_APWORLDS_DIR=/app/apworlds
     env_file:
-      - .env  # This ensures the container loads environment variables from .env
+      - .env  # DISCORD_TOKEN, GOMODE_OWNER_ID, tracker credentials, etc.
     restart: unless-stopped

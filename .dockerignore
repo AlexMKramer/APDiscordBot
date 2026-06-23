@@ -1,0 +1,12 @@
+# Keep the build context + image small. These are provided at runtime by the .:/app mount
+# (or regenerated), so they don't need to be baked into the image.
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+venv/
+gomode_analyzer/runtime/
+data/
+apworlds/*.apworld
+.env

@@ -1,0 +1,30 @@
+# Archipelago 0.6.7 logic dependencies for the go-mode analyzer venv (installed in the
+# Dockerfile into /opt/ap-venv, used by the analyzer subprocess via GOMODE_AP_PYTHON).
+#
+# This is a validated SUBSET of Archipelago's own requirements.txt. It omits:
+#   - kivy / kivymd : GUI, never needed to build world logic
+#   - Pymem         : Windows-only; a world that needs it just reports "unsupported" on Linux
+#   - cython / cymem: optional C speedups; the pure-Python fallback is used
+# and ADDS attrs, which AP worlds import (`from attr import ...`) but AP only pulls in
+# transitively. Versions pinned to a known-good AP 0.6.7 environment.
+#
+# Validated by surveying all 64 apworlds of the test seed: coverage matches a full Archipelago
+# venv exactly (only Super Smash Bros. 64 x2 and Neon White fail to load, for non-dependency
+# reasons). If a future seed uses a world that needs more, it degrades to "unsupported" and you
+# add the dependency here.
+#
+# NOTE: requires Python >= 3.11 (AP 0.6.7 uses typing.Self) -- the Dockerfile uses python:3.12.
+attrs==25.4.0
+bsdiff4==1.2.6
+certifi==2026.2.25
+colorama==0.4.6
+jellyfish==1.2.1
+Jinja2==3.1.6
+orjson==3.11.7
+pathspec==1.0.4
+platformdirs==4.9.4
+pyshortcuts==1.9.7
+PyYAML==6.0.3
+schema==0.7.8
+typing_extensions==4.15.0
+websockets==13.1
