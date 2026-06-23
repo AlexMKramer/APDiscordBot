@@ -150,9 +150,12 @@ async def process_data_package(data_package):
     # Convert back to a list for JSON output
     updated_data = list(existing_games_dict.values())
 
-    # Save the updated data back to the file
-    with open(data_package_json, "w") as outfile:
+    # Save the updated data back atomically: write a temp file then os.replace, so a reader
+    # (e.g. an autocomplete) can never observe a half-written data_package.json.
+    tmp_path = data_package_json + ".tmp"
+    with open(tmp_path, "w") as outfile:
         json.dump(updated_data, outfile, indent=4)
+    os.replace(tmp_path, data_package_json)
 
     return updated_data
 

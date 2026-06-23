@@ -10,6 +10,7 @@ import datetime
 import fnmatch
 import ap_connector
 import json
+import traceback
 import tracker_download
 import gomode_bot
 
@@ -29,8 +30,8 @@ else:
 # bot falls back to the guild owner.
 gomode_owner_id = os.getenv("GOMODE_OWNER_ID") or os.getenv("OWNER_ID")
 
-# Guard so on_connect (which can fire on every reconnect) starts the go-mode loop only once.
-go_mode_loop_started = False
+# Guard so on_connect (which can fire on every reconnect) starts the background loops only once.
+background_tasks_started = False
 
 
 def is_owner(ctx) -> bool:
@@ -52,6 +53,15 @@ async def on_connect():
         await bot.sync_commands()
     print(f'Logged in as {bot.user.name}')
 
+    # on_connect fires on EVERY gateway (re)connect; start the background loops exactly once.
+    # Otherwise each reconnect spawns another copy of each loop -> duplicate DMs / channel
+    # posts, overlapping tracker scrapes piling up on the thread pool, and racing writes to
+    # the JSON data files.
+    global background_tasks_started
+    if background_tasks_started:
+        return
+    background_tasks_started = True
+
     print("Starting user item tracker loop.")
     bot.loop.create_task(check_tracked_items_loop())
 
@@ -64,12 +74,8 @@ async def on_connect():
     else:
         bot.loop.create_task(check_for_item_changes(tracker_url, auth, discord_channel_id))
 
-    # on_connect can fire again on reconnect; only start the go-mode loop once.
-    global go_mode_loop_started
-    if not go_mode_loop_started:
-        go_mode_loop_started = True
-        print("Starting go-mode notification loop.")
-        bot.loop.create_task(check_go_mode_loop())
+    print("Starting go-mode notification loop.")
+    bot.loop.create_task(check_go_mode_loop())
 
 
 @bot.event
@@ -79,17 +85,45 @@ async def on_disconnect():
     await asyncio.sleep(5)
 
 
+@bot.event
+async def on_application_command_error(ctx, error):
+    # A genuinely-expired interaction (10062) is usually a transient hiccup and not actionable
+    # -- log one line instead of a full traceback. Everything else keeps the default traceback.
+    original = getattr(error, "original", error)
+    if isinstance(original, discord.NotFound) and getattr(original, "code", None) == 10062:
+        print(f"[interaction] command '{getattr(ctx.command, 'qualified_name', '?')}' "
+              f"expired before the bot could respond (10062); ignoring.")
+        return
+    traceback.print_exception(type(error), error, error.__traceback__)
+
+
+# data_package.json is large (~1.5 MB) and the two autocompletes below fire on every
+# keystroke, so parse it at most once per change (cached by mtime) instead of re-reading +
+# re-parsing on the event loop each time. Returns the last good value on a read/parse error
+# (e.g. the file being mid-rewrite by ap_connector), so a keystroke can never crash the
+# autocomplete on a partial file.
+_data_package_cache = {"mtime": None, "data": []}
+
+
+def _load_data_package():
+    path = os.path.join("data", "data_package.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return _data_package_cache["data"]
+    if _data_package_cache["mtime"] != mtime:
+        try:
+            with open(path, "r") as f:
+                _data_package_cache["data"] = json.load(f)
+            _data_package_cache["mtime"] = mtime
+        except (OSError, json.JSONDecodeError):
+            return _data_package_cache["data"]  # keep serving the last good parse
+    return _data_package_cache["data"]
+
+
 async def game_name_autocomplete(ctx: discord.AutocompleteContext):
-    game_names = []
-
-    os.makedirs("data", exist_ok=True)
-    data_package_json = os.path.join("data", "data_package.json")
-    with open(data_package_json, "r") as f:
-        data_package = json.load(f)
-
-    for entry in data_package:
-        game_name = entry.get("game")
-        game_names.append(game_name)
+    data_package = _load_data_package()
+    game_names = [entry.get("game") for entry in data_package if entry.get("game")]
     return [game_name for game_name in sorted(game_names) if game_name.lower().startswith(ctx.value.lower())]
 
 
@@ -98,14 +132,9 @@ async def items_autocomplete(ctx: discord.AutocompleteContext):
     if not selected_game:
         return []  # No game selected yet, so no suggestions.
 
-    os.makedirs("data", exist_ok=True)
-    data_package_json = os.path.join("data", "data_package.json")
-    with open(data_package_json, "r") as f:
-        data_package = json.load(f)
-
     # Find the game data matching the selected game.
     game_data = None
-    for entry in data_package:
+    for entry in _load_data_package():
         if entry.get("game", "") == selected_game:
             game_data = entry
             break
@@ -115,8 +144,6 @@ async def items_autocomplete(ctx: discord.AutocompleteContext):
 
     # Get the list of item names from the game data
     item_names = sorted(list(game_data.get("item_name_to_id", {}).keys()))
-    user_input = ctx.value or ""
-
     return [name for name in item_names if name.lower().startswith(ctx.value.lower())]
 
 
@@ -892,7 +919,11 @@ def format_diff_message(diff):
 
 async def no_dm_tracker(tracker_url, auth):
     while True:
-        await tracker_download.get_all_tracker_received_items(tracker_url, auth)
+        # get_all_tracker_received_items is BLOCKING (synchronous requests, one HTTP call per
+        # slot). Run it in a thread so it can't stall the event loop and make the bot miss
+        # Discord's 3s interaction-ack window (error 10062 "Unknown interaction").
+        await asyncio.get_running_loop().run_in_executor(
+            None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
         await asyncio.sleep(60)
 
 
@@ -905,8 +936,12 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
         return
 
     while not bot.is_closed():
-        # Get the new diff from tracker data.
-        diff = tracker_download.get_all_tracker_received_items(tracker_url, auth)
+        # Get the new diff from tracker data. This is BLOCKING (synchronous requests, one HTTP
+        # call per slot -- ~8s for a large seed), so run it in a thread; otherwise it stalls the
+        # event loop and the bot misses Discord's 3s interaction-ack window (error 10062, seen as
+        # "Application didn't respond" on commands AND autocompletes).
+        diff = await asyncio.get_running_loop().run_in_executor(
+            None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         if diff:
             print(f"Changes found at {current_time}")
