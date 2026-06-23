@@ -11,6 +11,7 @@ import fnmatch
 import ap_connector
 import json
 import tracker_download
+import gomode_bot
 
 dotenv.load_dotenv()
 discord_token = os.getenv("DISCORD_TOKEN")
@@ -23,6 +24,20 @@ if url_auth_username and tracker_password:
     auth = (url_auth_username, tracker_password)
 else:
     auth = None
+
+# Discord user allowed to run owner-only commands (e.g. /register_seed). If unset, the
+# bot falls back to the guild owner.
+gomode_owner_id = os.getenv("GOMODE_OWNER_ID") or os.getenv("OWNER_ID")
+
+# Guard so on_connect (which can fire on every reconnect) starts the go-mode loop only once.
+go_mode_loop_started = False
+
+
+def is_owner(ctx) -> bool:
+    if gomode_owner_id:
+        return str(ctx.author.id) == str(gomode_owner_id)
+    guild = getattr(ctx, "guild", None)
+    return bool(guild and ctx.author.id == guild.owner_id)
 
 # This enables users to interact with our bot as soon as it connects to the server.
 intents = discord.Intents.default()
@@ -48,6 +63,13 @@ async def on_connect():
         bot.loop.create_task(no_dm_tracker(tracker_url, auth))
     else:
         bot.loop.create_task(check_for_item_changes(tracker_url, auth, discord_channel_id))
+
+    # on_connect can fire again on reconnect; only start the go-mode loop once.
+    global go_mode_loop_started
+    if not go_mode_loop_started:
+        go_mode_loop_started = True
+        print("Starting go-mode notification loop.")
+        bot.loop.create_task(check_go_mode_loop())
 
 
 @bot.event
@@ -197,6 +219,216 @@ async def get_server_data(ctx, server_address: str, slot_name: str, password: st
                 pass
 
     bot.loop.create_task(run_connection())
+
+
+@bot.slash_command(description="(Owner) Register the current seed to enable go-mode tracking for its players.")
+@option("seed_file", description="The generated AP_<seed>.zip (multidata + spoiler).", required=False)
+@option("server_path", description="Or: the path to a seed zip already on the bot server (e.g. via FTP).", required=False)
+async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: str = None):
+    if not is_owner(ctx):
+        await ctx.respond("Only the server owner can register a seed.", ephemeral=True)
+        return
+
+    ok, why = gomode_bot.is_configured()
+    if not ok:
+        await ctx.respond(f"Go-mode tracking isn't configured yet: {why}", ephemeral=True)
+        return
+
+    if not seed_file and not server_path:
+        await ctx.respond(
+            "Attach the seed's generation zip, or pass `server_path` to one already on the server.",
+            ephemeral=True,
+        )
+        return
+
+    initial_response = await ctx.respond("Registering seed...", ephemeral=True)
+
+    # Resolve the seed zip: a small Discord attachment, or a server-side path (large apworlds
+    # stay on the server; only this ~1-2 MB zip ever travels through Discord).
+    if seed_file is not None:
+        seeds_dir = os.path.join(gomode_bot.RUNTIME_DIR, "seeds")
+        os.makedirs(seeds_dir, exist_ok=True)
+        # Discord doesn't guarantee a safe basename; strip any path components so a crafted
+        # filename can't escape seeds_dir (e.g. "..\\..\\main.py" or an absolute path).
+        safe_name = os.path.basename(seed_file.filename)
+        if not safe_name or safe_name in (".", ".."):
+            safe_name = "seed.zip"
+        zip_path = os.path.join(seeds_dir, safe_name)
+        try:
+            await seed_file.save(zip_path)
+        except Exception as e:
+            await initial_response.edit_original_response(content=f"Couldn't download the attachment: {e}")
+            return
+    else:
+        zip_path = server_path
+        if not os.path.isfile(zip_path):
+            await initial_response.edit_original_response(content=f"No file found at `{zip_path}` on the bot server.")
+            return
+
+    async def say(msg):
+        try:
+            await initial_response.edit_original_response(content=msg)
+        except Exception:
+            pass  # interaction token may have expired on a long precompute; DM below is the fallback
+
+    async def run():
+        try:
+            registry = await gomode_bot.register_seed(zip_path, progress=say)
+        except Exception as e:
+            # Mirror the success path's DM: a late failure (after the ephemeral token expired)
+            # would otherwise be invisible, since say()'s edit silently no-ops.
+            msg = f"Registration failed: {e}"
+            await say(msg)
+            try:
+                await ctx.author.send(msg)
+            except discord.Forbidden:
+                pass
+            return
+        summary = (
+            f"**Registered seed `{registry['seed']}`** (Archipelago {registry['version']}).\n"
+            f"- {registry['slot_count']} slots analyzed\n"
+            f"- {registry['verified']} with a full requirement breakdown\n"
+            f"- {registry['unsupported']} not supported (those players won't get go-mode tracking)\n"
+            f"Players can now use `/items_to_go_mode`, and I'll DM them when they reach go mode."
+        )
+        await say(summary)
+        # The precompute can run long enough to expire the ephemeral token; DM the owner so the
+        # result is never lost.
+        try:
+            await ctx.author.send(summary)
+        except discord.Forbidden:
+            pass
+
+    bot.loop.create_task(run())
+
+
+def _load_listeners() -> dict:
+    try:
+        with open(os.path.join("data", "listeners.json"), "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _go_mode_overview_line(name: str, st: dict) -> str:
+    game = st.get("game") or ""
+    tag = f" ({game})" if game else ""
+    status = st.get("status")
+    if status == "unregistered":
+        return f"• {name}{tag} — not part of the registered seed"
+    if status == "tracker_mismatch":
+        return f"• {name}{tag} — tracker shows a different game; is the right seed registered?"
+    if status == "unsupported":
+        return f"• {name}{tag} — go-mode tracking not supported for this game"
+    if status not in ("ok",):  # "error" or anything transient
+        return f"• {name}{tag} — couldn't check right now, try again shortly"
+    igm = st.get("in_go_mode")
+    if igm is True:
+        return f"• {name}{tag} — ✅ in go mode!"
+    if igm is False:
+        return f"• {name}{tag} — ⏳ not yet"
+    return f"• {name}{tag} — (couldn't determine right now)"
+
+
+async def _send_go_mode_detail(ctx, initial_response, slot_name: str):
+    """Detailed 'what do I still need' for one slot, against current inventory."""
+    inventory = gomode_bot.current_inventory(slot_name)
+    res = await gomode_bot.analyze_slot_live(slot_name, inventory)
+    if res is None:
+        await initial_response.edit_original_response(
+            content="No seed is registered yet. Ask the server owner to run /register_seed.")
+        return
+
+    game = res.get("game") or ""
+    header = f"**{slot_name}**" + (f" ({game})" if game else "")
+    status = res.get("status")
+    if status == "unsupported":
+        await initial_response.edit_original_response(
+            content=f"{header}\nGo-mode tracking isn't supported for this game yet.")
+        return
+    if status != "ok":  # "error" -- a transient build/subprocess failure, not "unsupported"
+        await initial_response.edit_original_response(
+            content=f"{header}\nCouldn't check this slot right now — please try again shortly.")
+        return
+    if res.get("in_go_mode"):
+        await initial_response.edit_original_response(
+            content=f"{header}\n🎉 You're in go mode — you have everything you need to finish!")
+        return
+
+    lines = res.get("requirements_text") or ["(no requirement details available)"]
+    body = f"{header}\n" + "\n".join(lines)
+    if len(body) <= 1900:
+        await initial_response.edit_original_response(content=body)
+        return
+    # Long requirement trees: DM the full list, and only claim success if the DM actually sent
+    # (catch HTTPException, not just Forbidden, so a rate-limit mid-stream can't escape).
+    try:
+        for chunk in chunk_text_by_line(body, 1900):
+            await ctx.author.send(chunk)
+        await initial_response.edit_original_response(
+            content=f"{header}\nThe list is long — I've sent it to you in a DM.")
+    except discord.Forbidden:
+        await initial_response.edit_original_response(
+            content=f"{header}\nThe list is long, but I couldn't DM you — please enable DMs.")
+    except discord.HTTPException:
+        await initial_response.edit_original_response(
+            content=f"{header}\nThe list is long, but I hit an error sending the DM — please try again.")
+
+
+@bot.slash_command(description="See what you still need to reach go mode for your assigned slots.")
+@option("slot_name", description="A specific slot (leave blank to see all your slots).",
+        autocomplete=slot_name_for_assigned_slot_autocomplete, required=False)
+async def items_to_go_mode(ctx, slot_name: str = None):
+    initial_response = await ctx.respond("Checking go-mode status...", ephemeral=True)
+
+    if gomode_bot.load_registry() is None:
+        await initial_response.edit_original_response(
+            content="No seed is registered yet. Ask the server owner to run /register_seed.")
+        return
+
+    author_id = str(ctx.author.id)
+    assignments = _load_listeners().get(author_id, [])
+    my_slots = [a.get("slot_name") for a in assignments if a.get("slot_name")]
+    if not my_slots:
+        await initial_response.edit_original_response(
+            content="You have no assigned slots. Use /assign_slot first.")
+        return
+
+    # A specific slot (or the only one you have) -> the detailed list of what's left.
+    if slot_name:
+        if not any(s.lower() == slot_name.lower() for s in my_slots):
+            await initial_response.edit_original_response(
+                content=f"You don't have **{slot_name}** assigned to you.")
+            return
+        await _send_go_mode_detail(ctx, initial_response, slot_name)
+        return
+    if len(my_slots) == 1:
+        await _send_go_mode_detail(ctx, initial_response, my_slots[0])
+        return
+
+    # Otherwise an at-a-glance overview of every slot you hold.
+    status = await gomode_bot.go_mode_status(my_slots)
+    lines = ["**Go-mode status for your slots:**"]
+    lines += [_go_mode_overview_line(name, status.get(name, {})) for name in sorted(my_slots)]
+    lines.append("")
+    lines.append("Run `/items_to_go_mode slot:<name>` to see exactly what a slot still needs.")
+    content = "\n".join(lines)
+    if len(content) <= 1900:
+        await initial_response.edit_original_response(content=content)
+        return
+    # Many assigned slots (e.g. via a wildcard assign) can overflow -- DM the full list rather
+    # than silently truncating it.
+    try:
+        for chunk in chunk_text_by_line(content, 1900):
+            await ctx.author.send(chunk)
+        await initial_response.edit_original_response(
+            content="Your list is long — I've sent the full status to you in a DM.")
+    except discord.Forbidden:
+        await initial_response.edit_original_response(
+            content="Your status list is too long to show here and I couldn't DM you — please enable DMs.")
+    except discord.HTTPException:
+        await initial_response.edit_original_response(
+            content="Your status list is long, but I hit an error sending the DM — please try again.")
 
 
 @bot.slash_command(description="Assign your discord account to a slot name. Use * as a wildcard to assign several at once.")
@@ -927,6 +1159,121 @@ async def check_tracked_items_loop():
 
         # Wait a while before checking again (adjust the sleep time as needed)
         await asyncio.sleep(10)
+
+
+async def check_go_mode_loop():
+    """Edge-triggered go-mode notifications: DM the player who holds a slot the moment it
+    reaches go mode. Verified slots are evaluated instantly in-process; the few fallback
+    slots share one fast oracle subprocess. Each slot is notified once per registered seed."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await _run_go_mode_notifications()
+        except Exception as e:  # never let one bad cycle kill the loop
+            print(f"[go-mode] notification check error: {e}")
+        await asyncio.sleep(120)
+
+
+# Process-level guards so a persistence failure can't cause re-DMing, and so unchanged
+# fallback slots aren't rebuilt by the oracle every cycle. Both are keyed with the seed so
+# they self-reset when a new seed is registered.
+_go_mode_dm_sent = set()       # {(seed, author_id, slot_name)} delivered this process run
+_go_mode_fallback_sig = {}     # {slot_name: (seed, inventory_signature)} last "not yet" check
+
+
+def _inventory_sig(inv: dict):
+    return tuple(sorted(inv.items()))
+
+
+async def _run_go_mode_notifications():
+    reg = gomode_bot.load_registry()
+    if not reg:
+        return  # no seed registered yet
+    seed = reg.get("seed")
+
+    # slot_name -> set of Discord user ids assigned to it (usually exactly one)
+    slot_to_authors = {}
+    for author_id, assignments in _load_listeners().items():
+        for a in assignments:
+            sn = a.get("slot_name")
+            if sn:
+                slot_to_authors.setdefault(sn, set()).add(author_id)
+    if not slot_to_authors:
+        return
+
+    notified = gomode_bot.load_notified(seed)  # set of "author_id:slot_name" tokens
+
+    def tok(author_id, sn):
+        return f"{author_id}:{sn}"  # author_id is always numeric, so this is unambiguous
+
+    def pending_authors(sn):
+        # Authors for this slot not yet notified (persisted OR delivered this run). Keyed
+        # per (author, slot) so a late-assigned author still gets the DM.
+        return [a for a in slot_to_authors[sn]
+                if tok(a, sn) not in notified and (seed, a, sn) not in _go_mode_dm_sent]
+
+    candidate_slots = [sn for sn in slot_to_authors if pending_authors(sn)]
+    if not candidate_slots:
+        return
+
+    items_received = gomode_bot._load_items_received()
+    cache = gomode_bot.load_cache()
+
+    def is_fallback(sn):
+        rec = gomode_bot.slot_for_name(cache, sn) if cache else None
+        return bool(rec and rec.get("status") == "ok"
+                    and not rec.get("requirements", {}).get("verified"))
+
+    # Throttle: a fallback slot can't reach go mode without its inventory changing, and each
+    # check rebuilds its world. Skip fallback slots whose inventory is unchanged since the last
+    # "not yet" result. Verified slots are cheap (in-process) and always checked.
+    to_check = []
+    for sn in candidate_slots:
+        if is_fallback(sn):
+            sig = (seed, _inventory_sig(gomode_bot.inventory_for_slot(items_received, sn)))
+            if _go_mode_fallback_sig.get(sn) == sig:
+                continue
+        to_check.append(sn)
+    if not to_check:
+        return
+
+    status = await gomode_bot.go_mode_status(to_check, items_received=items_received)
+
+    changed = False
+    for sn in to_check:
+        st = status.get(sn, {})
+        igm = st.get("in_go_mode")
+        # Remember a definitive "not yet" for fallback slots so we don't rebuild next cycle.
+        if is_fallback(sn) and st.get("status") == "ok" and igm is False:
+            _go_mode_fallback_sig[sn] = (
+                seed, _inventory_sig(gomode_bot.inventory_for_slot(items_received, sn)))
+        if not (st.get("status") == "ok" and igm is True):
+            continue
+        game = st.get("game") or ""
+        msg = (f"🎉 **{sn}**" + (f" ({game})" if game else "") +
+               " has reached **go mode** — you now have everything you need to reach your "
+               "goal in logic. Congrats!")
+        for author_id in pending_authors(sn):
+            try:
+                user = await bot.fetch_user(int(author_id))
+                if user:
+                    await user.send(msg)
+                    # Mark notified ONLY after the DM actually sends, so a closed-DM/transient
+                    # failure is retried next cycle instead of being silently lost.
+                    notified.add(tok(author_id, sn))
+                    _go_mode_dm_sent.add((seed, author_id, sn))
+                    changed = True
+            except discord.Forbidden:
+                print(f"[go-mode] could not DM {author_id} for {sn} (DMs disabled)")
+            except Exception as e:
+                print(f"[go-mode] DM error for {author_id}/{sn}: {e}")
+
+    if changed:
+        try:
+            gomode_bot.save_notified(seed, notified)
+        except Exception as e:
+            # Persistence failed, but the in-process guard already prevents re-DMing this run.
+            print(f"[go-mode] could not persist notified state: {e}")
 
 
 if __name__ == "__main__":

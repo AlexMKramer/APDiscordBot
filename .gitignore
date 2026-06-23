@@ -42,3 +42,10 @@ items_received.json
 slot_info.json
 /.env
 /data
+
+# go-mode analyzer: provisioned AP trees + manifests are large, generated artifacts
+/gomode_analyzer/runtime/
+
+# Python bytecode
+__pycache__/
+*.pyc
