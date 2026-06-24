@@ -6,7 +6,10 @@ import requests
 
 
 def get_tracker_urls(tracker_url, auth):
-    page = requests.get(url=tracker_url, auth=auth)
+    # Always pass a timeout: without one a stalled connection hangs indefinitely (the default
+    # connect timeout is None), tying up the worker thread. On failure this raises, which the
+    # caller's loop catches, logs, and retries next cycle (last-good data is preserved).
+    page = requests.get(url=tracker_url, auth=auth, timeout=15)
     soup = BeautifulSoup(page.content, "html.parser")
 
     urls = []
@@ -63,7 +66,7 @@ def get_tracker_urls(tracker_url, auth):
 
 def track_items_from_slot(tracker_url, url, auth):
     tracker_slot_url = tracker_url.split("/tracker")[0] + "/generic_tracker" + url
-    page = requests.get(tracker_slot_url, auth=auth)
+    page = requests.get(tracker_slot_url, auth=auth, timeout=15)
     soup = BeautifulSoup(page.content, "html.parser")
 
     items = []

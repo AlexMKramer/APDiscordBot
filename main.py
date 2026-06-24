@@ -80,9 +80,15 @@ async def on_connect():
 
 @bot.event
 async def on_disconnect():
-    disconnect_time = datetime.datetime.now()
-    print(f'{bot.user.name} failed to reconnect at {disconnect_time}')
-    await asyncio.sleep(5)
+    # Fires on every gateway disconnect. py-cord auto-reconnects (and resumes the session),
+    # so this is informational, NOT a failure -- the old "failed to reconnect" wording was
+    # misleading. A matching on_resumed/on_connect line confirms the reconnect.
+    print(f'Disconnected from the Discord gateway at {datetime.datetime.now()} (will auto-reconnect).')
+
+
+@bot.event
+async def on_resumed():
+    print(f'Resumed the Discord gateway session at {datetime.datetime.now()}.')
 
 
 @bot.event
@@ -922,8 +928,13 @@ async def no_dm_tracker(tracker_url, auth):
         # get_all_tracker_received_items is BLOCKING (synchronous requests, one HTTP call per
         # slot). Run it in a thread so it can't stall the event loop and make the bot miss
         # Discord's 3s interaction-ack window (error 10062 "Unknown interaction").
-        await asyncio.get_running_loop().run_in_executor(
-            None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
+        # Wrapped so a transient error (e.g. the tracker host timing out) is logged and retried
+        # next cycle instead of killing the loop permanently.
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
+        except Exception as e:
+            print(f"[tracker] scrape failed (will retry next cycle): {e}")
         await asyncio.sleep(60)
 
 
@@ -940,21 +951,27 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
         # call per slot -- ~8s for a large seed), so run it in a thread; otherwise it stalls the
         # event loop and the bot misses Discord's 3s interaction-ack window (error 10062, seen as
         # "Application didn't respond" on commands AND autocompletes).
-        diff = await asyncio.get_running_loop().run_in_executor(
-            None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
-        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        if diff:
-            print(f"Changes found at {current_time}")
-            message = format_diff_message(diff)
-            # Prepare to send the message in a code block.
-            # Adjust the maximum content length to account for the code block wrappers.
-            wrapper_length = len("```\n") + len("\n```")
-            max_content_length = 1950 - wrapper_length
-            chunks = chunk_text_by_line(message, max_content_length)
-            for chunk in chunks:
-                await channel.send(f"```ansi\n{chunk}\n```")
-        else:
-            print(f"No changes found at {current_time}")
+        # Wrapped so a transient failure (e.g. the tracker host timing out) is logged and retried
+        # next cycle instead of killing the loop permanently (it is started once and never
+        # restarted, so an unhandled exception would stop tracking until a full bot restart).
+        try:
+            diff = await asyncio.get_running_loop().run_in_executor(
+                None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
+            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            if diff:
+                print(f"Changes found at {current_time}")
+                message = format_diff_message(diff)
+                # Prepare to send the message in a code block.
+                # Adjust the maximum content length to account for the code block wrappers.
+                wrapper_length = len("```\n") + len("\n```")
+                max_content_length = 1950 - wrapper_length
+                chunks = chunk_text_by_line(message, max_content_length)
+                for chunk in chunks:
+                    await channel.send(f"```ansi\n{chunk}\n```")
+            else:
+                print(f"No changes found at {current_time}")
+        except Exception as e:
+            print(f"[tracker] item-change check failed (will retry next cycle): {e}")
 
         # Wait 60 seconds before checking again.
         await asyncio.sleep(60)
@@ -1092,108 +1109,115 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
 
 async def check_tracked_items_loop():
     await bot.wait_until_ready()  # Ensure the bot is ready before starting the loop
+    while not bot.is_closed():
+        # Wrapped so a transient error never kills the loop (it is started once and never
+        # restarted, so an unhandled exception would stop per-user item tracking until a full
+        # bot restart).
+        try:
+            await _run_tracked_items_check()
+        except Exception as e:
+            print(f"[tracked-items] check failed (will retry next cycle): {e}")
+        await asyncio.sleep(10)
 
+
+async def _run_tracked_items_check():
     os.makedirs("data", exist_ok=True)
     listeners_data_json = os.path.join("data", "listeners.json")
     items_received_json = os.path.join("data", "items_received.json")
 
+    # Load items_received.json
+    try:
+        with open(items_received_json, "r") as f:
+            items_received = json.load(f)
+    except Exception as e:
+        print(f"Error loading {items_received_json}: {e}")
+        return
 
-    while not bot.is_closed():
-        # Load items_received.json
-        try:
-            with open(items_received_json, "r") as f:
-                items_received = json.load(f)
-        except Exception as e:
-            print(f"Error loading {items_received_json}: {e}")
-            await asyncio.sleep(10)
-            continue
+    # Load listeners.json (the tracking assignments)
+    if os.path.exists(listeners_data_json):
+        with open(listeners_data_json, "r") as f:
+            try:
+                listeners_data = json.load(f)
+            except json.JSONDecodeError:
+                listeners_data = {}
+    else:
+        listeners_data = {}
 
-        # Load listeners.json (the tracking assignments)
-        if os.path.exists(listeners_data_json):
-            with open(listeners_data_json, "r") as f:
-                try:
-                    listeners_data = json.load(f)
-                except json.JSONDecodeError:
-                    listeners_data = {}
-        else:
-            listeners_data = {}
+    any_update = False  # Flag to determine if we need to update the file
 
-        any_update = False  # Flag to determine if we need to update the file
+    # Iterate over each user (by author ID) in listeners_data
+    for user_id, assignments in listeners_data.items():
+        user_messages = []  # Collect messages for the user across assignments
+        for assignment in assignments:
+            slot_name = assignment.get("slot_name")
+            tracked_items = assignment.get("tracked_items", {})
 
-        # Iterate over each user (by author ID) in listeners_data
-        for user_id, assignments in listeners_data.items():
-            user_messages = []  # Collect messages for the user across assignments
-            for assignment in assignments:
-                slot_name = assignment.get("slot_name")
-                tracked_items = assignment.get("tracked_items", {})
+            # If tracked_items is a list (from an older structure), convert it to a dictionary.
+            if isinstance(tracked_items, list):
+                new_tracked = {}
+                for item in tracked_items:
+                    # Set a default target amount of 1 (or adjust as needed)
+                    new_tracked[item] = {"target": 1, "current": 0}
+                assignment["tracked_items"] = new_tracked
+                tracked_items = new_tracked
 
-                # If tracked_items is a list (from an older structure), convert it to a dictionary.
-                if isinstance(tracked_items, list):
-                    new_tracked = {}
-                    for item in tracked_items:
-                        # Set a default target amount of 1 (or adjust as needed)
-                        new_tracked[item] = {"target": 1, "current": 0}
-                    assignment["tracked_items"] = new_tracked
-                    tracked_items = new_tracked
+            # Find the corresponding slot in items_received.json.
+            slot_items_data = None
+            for slot_num, slot_data in items_received.items():
+                if slot_name in slot_data:
+                    slot_items_data = slot_data[slot_name]
+                    break
 
-                # Find the corresponding slot in items_received.json.
-                slot_items_data = None
-                for slot_num, slot_data in items_received.items():
-                    if slot_name in slot_data:
-                        slot_items_data = slot_data[slot_name]
-                        break
+            if slot_items_data:
+                items_dict = slot_items_data.get("Items", {})
+                # For each tracked item, calculate the total received amount.
+                items_to_remove = []
+                for tracked_item, tracking_info in tracked_items.items():
+                    target = tracking_info.get("target", 0)
+                    current = tracking_info.get("current", 0)
+                    total_received = 0
 
-                if slot_items_data:
-                    items_dict = slot_items_data.get("Items", {})
-                    # For each tracked item, calculate the total received amount.
-                    items_to_remove = []
-                    for tracked_item, tracking_info in tracked_items.items():
-                        target = tracking_info.get("target", 0)
-                        current = tracking_info.get("current", 0)
-                        total_received = 0
+                    # Sum amounts for matching tracked_item in the received items
+                    for key, item_info in items_dict.items():
+                        if item_info.get("item_name", "").lower() == tracked_item.lower():
+                            try:
+                                amt = int(item_info.get("amount", 0))
+                            except ValueError:
+                                amt = 0
+                            total_received += amt
 
-                        # Sum amounts for matching tracked_item in the received items
-                        for key, item_info in items_dict.items():
-                            if item_info.get("item_name", "").lower() == tracked_item.lower():
-                                try:
-                                    amt = int(item_info.get("amount", 0))
-                                except ValueError:
-                                    amt = 0
-                                total_received += amt
+                    if total_received > current:
+                        new_count = total_received - current
+                        tracking_info["current"] = total_received
+                        if total_received >= target:
+                            user_messages.append(
+                                f"Your tracked item **{tracked_item}** has reached the target ({total_received}/{target}) for slot **{slot_name}** in game **{assignment.get('game', 'Unknown')}**. Tracking for this item is now complete."
+                            )
+                            items_to_remove.append(tracked_item)
+                        else:
+                            user_messages.append(
+                                f"You received **{new_count}** new **{tracked_item}** (total: {total_received}/{target}) for slot **{slot_name}** in game **{assignment.get('game', 'Unknown')}**."
+                            )
+                # Remove items that have reached or exceeded the target from tracking
+                for item in items_to_remove:
+                    tracked_items.pop(item, None)
+                any_update = True
 
-                        if total_received > current:
-                            new_count = total_received - current
-                            tracking_info["current"] = total_received
-                            if total_received >= target:
-                                user_messages.append(
-                                    f"Your tracked item **{tracked_item}** has reached the target ({total_received}/{target}) for slot **{slot_name}** in game **{assignment.get('game', 'Unknown')}**. Tracking for this item is now complete."
-                                )
-                                items_to_remove.append(tracked_item)
-                            else:
-                                user_messages.append(
-                                    f"You received **{new_count}** new **{tracked_item}** (total: {total_received}/{target}) for slot **{slot_name}** in game **{assignment.get('game', 'Unknown')}**."
-                                )
-                    # Remove items that have reached or exceeded the target from tracking
-                    for item in items_to_remove:
-                        tracked_items.pop(item, None)
-                    any_update = True
+        # DM the user if there are any messages
+        if user_messages:
+            try:
+                user_obj = await bot.fetch_user(int(user_id))
+                if user_obj:
+                    await user_obj.send("\n".join(user_messages))
+            except discord.Forbidden:
+                print(f"Could not DM user {user_id}. They might have DMs disabled.")
+            except Exception as e:
+                print(f"[tracked-items] could not DM user {user_id}: {e}")
 
-            # DM the user if there are any messages
-            if user_messages:
-                try:
-                    user_obj = await bot.fetch_user(int(user_id))
-                    if user_obj:
-                        await user_obj.send("\n".join(user_messages))
-                except discord.Forbidden:
-                    print(f"Could not DM user {user_id}. They might have DMs disabled.")
-
-        # If any updates were made, save the updated listeners data back to file
-        if any_update:
-            with open(listeners_data_json, "w") as f:
-                json.dump(listeners_data, f, indent=4)
-
-        # Wait a while before checking again (adjust the sleep time as needed)
-        await asyncio.sleep(10)
+    # If any updates were made, save the updated listeners data back to file
+    if any_update:
+        with open(listeners_data_json, "w") as f:
+            json.dump(listeners_data, f, indent=4)
 
 
 async def check_go_mode_loop():
