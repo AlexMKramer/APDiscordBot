@@ -74,6 +74,9 @@ async def on_connect():
     else:
         bot.loop.create_task(check_for_item_changes(tracker_url, auth, discord_channel_id))
 
+        print("Starting hourly percentage update loop.")
+        bot.loop.create_task(hourly_percentage_loop(discord_channel_id))
+
     print("Starting go-mode notification loop.")
     bot.loop.create_task(check_go_mode_loop())
 
@@ -975,6 +978,98 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
 
         # Wait 60 seconds before checking again.
         await asyncio.sleep(60)
+
+
+# --- Hourly completion-percentage update ----------------------------------------------------
+# The tracker loop above rewrites data/items_received.json every 60s, so this loop just reads
+# the per-slot "Checks Status" cells out of that file -- it makes no extra HTTP requests. The
+# last announced figure is persisted so a bot restart neither re-announces nor loses it.
+percentage_state_json = os.path.join("data", "percentage_state.json")
+
+
+def _load_percentage_state():
+    try:
+        with open(percentage_state_json, "r") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"[percentage] could not read {percentage_state_json}: {e}")
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _save_percentage_state(checked, total, percent_text):
+    os.makedirs("data", exist_ok=True)
+    state = {
+        "checked": checked,
+        "total": total,
+        "percent": percent_text,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+    }
+    try:
+        with open(percentage_state_json, "w") as f:
+            json.dump(state, f, indent=4)
+    except Exception as e:
+        print(f"[percentage] could not write {percentage_state_json}: {e}")
+
+
+def _seconds_until_next_hour():
+    now = datetime.datetime.now()
+    next_hour = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    # Clamp: if we wake a hair early, sleeping a second more still lands us on the hour.
+    return max(1.0, (next_hour - now).total_seconds())
+
+
+async def hourly_percentage_loop(channel_id):
+    """Once an hour, on the hour, post how the multiworld's completion percentage moved --
+    but only when the figure actually changed, so quiet hours stay silent."""
+    await bot.wait_until_ready()
+    channel = bot.get_channel(int(channel_id))
+    if channel is None:
+        print(f"Channel with ID {channel_id} not found; skipping hourly percentage updates.")
+        return
+
+    while not bot.is_closed():
+        await asyncio.sleep(_seconds_until_next_hour())
+        # Wrapped so a transient error (unreadable data file, Discord hiccup) is logged and
+        # retried next hour instead of killing the loop until a full bot restart.
+        try:
+            await _report_percentage_change(channel)
+        except Exception as e:
+            print(f"[percentage] hourly update failed (will retry next hour): {e}")
+
+
+async def _report_percentage_change(channel):
+    completion = tracker_download.overall_completion()
+    if completion is None:
+        print("[percentage] no parseable checks data yet; skipping this hour.")
+        return
+    checked, total = completion
+    percent_text = f"{(checked / total) * 100:.2f}%"
+
+    state = _load_percentage_state()
+    previous = (state or {}).get("percent")
+
+    # First run (fresh install, or a brand new seed's first hour): record the baseline
+    # silently -- there is no "went from" to report yet.
+    if not previous:
+        _save_percentage_state(checked, total, percent_text)
+        print(f"[percentage] baseline recorded at {percent_text} ({checked}/{total}).")
+        return
+
+    if percent_text == previous:
+        print(f"[percentage] unchanged at {percent_text}; nothing to announce.")
+        return
+
+    # Only persist after the message actually lands, so a failed send re-reports next hour
+    # against the same baseline instead of silently swallowing the change.
+    await channel.send(
+        f"Percentage went from **{previous}** to **{percent_text}** in the last hour! "
+        f"({checked:,}/{total:,} checks)"
+    )
+    _save_percentage_state(checked, total, percent_text)
+    print(f"[percentage] announced {previous} -> {percent_text} ({checked}/{total}).")
 
 
 # Slash command to DM the user a list of all items for their tracked slots.

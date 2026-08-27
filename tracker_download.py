@@ -207,3 +207,56 @@ def get_all_tracker_received_items(tracker_url, auth):
     return diff
 
 
+def parse_checks_status(text):
+    """Parse a tracker "Checks Status" cell ("28/417") into (checked, total).
+
+    Returns None for anything unparseable (missing cell, odd formatting, zero total) so a
+    single bad row can't skew or crash the multiworld total."""
+    if not isinstance(text, str) or "/" not in text:
+        return None
+    checked_text, _, total_text = text.partition("/")
+    try:
+        checked = int(checked_text.strip().replace(",", ""))
+        total = int(total_text.strip().replace(",", ""))
+    except ValueError:
+        return None
+    if total <= 0:
+        return None
+    return checked, total
+
+
+def overall_completion(items_received=None):
+    """Sum every slot's "Checks Status" into (checked, total) for the whole multiworld.
+
+    Reads data/items_received.json (rewritten by get_all_tracker_received_items every cycle)
+    when no data is passed, so callers cost no extra HTTP requests. Returns None when no slot
+    reports a parseable checks count."""
+    if items_received is None:
+        items_received_json = os.path.join("data", "items_received.json")
+        try:
+            with open(items_received_json, "r") as infile:
+                items_received = json.load(infile)
+        except Exception as e:
+            print(f"[percentage] could not read {items_received_json}: {e}")
+            return None
+
+    total_checked = 0
+    total_checks = 0
+    found = False
+    for slot_data in (items_received or {}).values():
+        if not isinstance(slot_data, dict):
+            continue
+        # Each slot maps its slot name to the details dict.
+        for details in slot_data.values():
+            if not isinstance(details, dict):
+                continue
+            parsed = parse_checks_status(details.get("Checks Status"))
+            if parsed is None:
+                continue
+            total_checked += parsed[0]
+            total_checks += parsed[1]
+            found = True
+
+    if not found or total_checks <= 0:
+        return None
+    return total_checked, total_checks
