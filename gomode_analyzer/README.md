@@ -23,7 +23,7 @@ run). So it cannot leak routing spoilers like "complete location Y to get player
 | File | Runs in | Purpose |
 |------|---------|---------|
 | `provision.py` | plain Python (the bot can call it) | Detect the seed's AP version, materialize a matching AP source tree, install the host's apworlds, write a manifest. |
-| `seed_data.py` | AP env | Decode a generated `AP_<seed>.zip` → per-slot `{game, slot_data, resolved options, precollected, spoiler settings, datapackage checksum, real location IDs, real progression items}` + version + the generation seed (from the spoiler header). |
+| `seed_data.py` | AP env | Decode a generated `AP_<seed>.zip` → per-slot `{game, slot_data, resolved options, precollected, spoiler settings, datapackage, real location IDs, real progression items}` + version + the generation seed (from the spoiler header). |
 | `spoiler_options.py` | mixed | Parse the spoiler's per-player blocks (pure text) and reverse the options back into `{attr: value}` (AP env). Recovers settings for worlds that put nothing in slot_data. |
 | `engine.py` | AP env | Rebuild a slot's world (no fill) the way Universal Tracker does, plus a replay of the slot's real RNG; compute go-mode + the minimal still-needed item set, with guardrails. |
 | `cli.py` | AP env | JSON entrypoint the bot calls for an on-demand single-slot analysis. Emits clean JSON only. |
@@ -158,8 +158,10 @@ multidata's precollected items), so the rebuild strips every real start item and
 inventory supply it, as UT does. The multidata's start items still count toward the universe
 of items the player can hold, as do items a world places itself in `pre_fill`.
 
-**apworld version:** if the installed apworld's datapackage checksum differs from the one the
-seed was generated with, the slot is `unsupported` and the registration summary names it.
+**apworld version:** if the installed apworld's item/location data differs from what the seed
+was generated with, the slot is `unsupported` and the registration summary names it. Contents
+are compared rather than the datapackage checksum, which hashes insertion order: Pokemon
+Emerald builds its location table in a different order on Linux than on Windows.
 
 ## `requirements`: the full decomposition (and how it's trustworthy)
 

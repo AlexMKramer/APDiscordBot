@@ -27,7 +27,7 @@ class SlotData:
     precollected: list = field(default_factory=list)      # starting-inventory item IDs (codes)
     spoiler_settings: dict = field(default_factory=dict)  # raw {display name: value} from the spoiler block
     slot_data: dict = field(default_factory=dict)         # the slot's full slot_data (UT regen passthrough)
-    datapackage_checksum: Optional[str] = None            # the game's checksum when the seed was generated
+    datapackage: dict = field(default_factory=dict)       # the game's datapackage the seed was generated with
     # What the real generation produced for this slot, to check a rebuild against:
     location_ids: set = field(default_factory=set)        # the slot's real location IDs
     prog_item_ids: Counter = field(default_factory=Counter)  # its progression items placed anywhere
@@ -52,7 +52,7 @@ class SeedData:
         return {
             "slot": sd.slot, "name": sd.name, "spoiler_settings": sd.spoiler_settings,
             "precollected": sd.precollected, "slot_data": sd.slot_data,
-            "datapackage_checksum": sd.datapackage_checksum,
+            "datapackage": sd.datapackage,
             "gen_seed": None if self.race_mode else self.gen_seed, "players": self.players,
             "expected_locations": sd.location_ids, "expected_prog": sd.prog_item_ids,
         }
@@ -112,7 +112,7 @@ def load_seed(zip_path: str) -> SeedData:
             precollected=list(precollected.get(sid, []) or []),
             spoiler_settings=blocks.get(sid, {}).get("settings", {}),
             slot_data=dict(sd) if isinstance(sd, dict) else {},
-            datapackage_checksum=(datapackage.get(game) or {}).get("checksum"),
+            datapackage=datapackage.get(game) or {},
             location_ids=location_ids.get(sid, set()),
             prog_item_ids=prog_item_ids.get(sid, Counter()),
         )

@@ -266,6 +266,22 @@ def _finish(multiworld, world_type, precollected):
                         prog_names={item.name for item in universe}, templates=templates), ""
 
 
+def _same_datapackage(world_type, seed_package: dict) -> bool:
+    """Whether the installed world has the item/location names and IDs the seed was generated
+    with. Compares contents, not the checksum: the checksum hashes insertion order, and some
+    worlds build their tables in a platform-dependent order (Pokemon Emerald's locations)."""
+    ours = world_type.get_data_package_data()
+    for key in ("item_name_to_id", "location_name_to_id"):
+        if dict(ours.get(key, {})) != dict(seed_package.get(key, {})):
+            return False
+    for key in ("item_name_groups", "location_name_groups"):
+        mine = {name: sorted(members) for name, members in ours.get(key, {}).items()}
+        theirs = {name: sorted(members) for name, members in seed_package.get(key, {}).items()}
+        if mine != theirs:
+            return False
+    return True
+
+
 def _mismatch(multiworld, expected_locations: set, expected_prog: Counter) -> int:
     """How far a rebuilt slot is from what the real generation recorded: its location IDs, and
     the progression items it owns (placed anywhere). 0 means the same world."""
@@ -295,7 +311,7 @@ def _mismatch(multiworld, expected_locations: set, expected_prog: Counter) -> in
 
 def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: str = "",
                  spoiler_settings: Optional[dict] = None, precollected: Optional[list] = None,
-                 slot_data: Optional[dict] = None, datapackage_checksum: Optional[str] = None,
+                 slot_data: Optional[dict] = None, datapackage: Optional[dict] = None,
                  gen_seed: Optional[int] = None, players: int = 0,
                  expected_locations: Optional[set] = None, expected_prog: Optional[Counter] = None,
                  result: Optional[SlotResult] = None):
@@ -324,13 +340,11 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
 
     # The installed apworld must be the one that generated the seed. A different version can
     # have different logic, and would silently answer with the wrong rules.
-    if datapackage_checksum:
-        installed = world_type.get_data_package_data().get("checksum")
-        if installed != datapackage_checksum:
-            result.status = "unsupported"
-            result.reason = ("The installed apworld doesn't match the one that generated this seed "
-                             "(datapackage checksum differs). Install the same apworld version.")
-            return None, result
+    if datapackage and not _same_datapackage(world_type, datapackage):
+        result.status = "unsupported"
+        result.reason = ("The installed apworld doesn't match the one that generated this seed "
+                         "(its item or location data differs). Install the same apworld version.")
+        return None, result
 
     # Resolve options: spoiler-recovered as a base, slot_data overriding it (slot_data is
     # exact/typed; the spoiler is parsed from text). Anything still missing -> world default.
@@ -442,7 +456,7 @@ def inventory_state(prepared: PreparedSlot, inventory: dict):
 def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[int] = None,
                  name: str = "", spoiler_settings: Optional[dict] = None,
                  precollected: Optional[list] = None, slot_data: Optional[dict] = None,
-                 datapackage_checksum: Optional[str] = None, gen_seed: Optional[int] = None,
+                 datapackage: Optional[dict] = None, gen_seed: Optional[int] = None,
                  players: int = 0, expected_locations: Optional[set] = None,
                  expected_prog: Optional[Counter] = None, fast: bool = False) -> SlotResult:
     """Analyze one slot.
@@ -462,7 +476,7 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
     result = SlotResult(slot=slot, name=name or "", game=game, status="error")
     prepared, result = prepare_slot(game, options, slot=slot, name=name,
                                     spoiler_settings=spoiler_settings, precollected=precollected,
-                                    slot_data=slot_data, datapackage_checksum=datapackage_checksum,
+                                    slot_data=slot_data, datapackage=datapackage,
                                     gen_seed=gen_seed, players=players,
                                     expected_locations=expected_locations,
                                     expected_prog=expected_prog, result=result)
