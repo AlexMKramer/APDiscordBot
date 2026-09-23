@@ -44,15 +44,15 @@ def main(argv=None) -> int:
         for sid, sd in seed.slots.items():
             if only is not None and sid not in only:
                 continue
-            res = engine.analyze_slot(sd.game, sd.options, {}, slot=sid, name=sd.name,
-                                      spoiler_settings=sd.spoiler_settings,
-                                      precollected=sd.precollected)
+            res = engine.analyze_slot(sd.game, sd.options, {}, **seed.engine_kwargs(sd))
             slots[str(sid)] = {
                 "name": sd.name,
                 "game": sd.game,
                 "status": res.status,
                 "reason": res.reason,
                 "options_source": res.options_source,
+                "regen": res.regen,
+                "mismatch": res.mismatch,
                 "requirements": res.requirements,   # verified tree OR conservative fallback
             }
         cache = {"seed": seed.seed_name, "version": seed.version_str, "slots": slots}
@@ -67,7 +67,11 @@ def main(argv=None) -> int:
         "slots": len(cache["slots"]),
         "verified": sum(1 for s in cache["slots"].values()
                         if s["requirements"].get("verified")),
+        # Rebuilt as the same world the real generation built (locations + progression items).
+        "exact": sum(1 for s in cache["slots"].values() if s["status"] == "ok" and s["mismatch"] == 0),
         "unsupported": sum(1 for s in cache["slots"].values() if s["status"] != "ok"),
+        "unsupported_slots": [{"name": s["name"], "game": s["game"], "reason": s["reason"]}
+                              for s in cache["slots"].values() if s["status"] != "ok"],
         "out": os.path.abspath(args.out),
     }
     print(json.dumps(summary))

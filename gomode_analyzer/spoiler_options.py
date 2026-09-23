@@ -7,11 +7,12 @@ so we can invert it: build the same `display_name -> attribute` map from the wor
 options dataclass and convert each value string back with the option's own
 `from_any`/`from_text`.
 
-We deliberately only resolve *scalar* option types (Toggle / Choice / Range / FreeText
-and their subclasses such as NamedRange / TextChoice). Those are the ones that (a) gate
-logic and (b) round-trip cleanly from the spoiler text. List/dict/plando options are
-left at their defaults -- they mostly affect fill/placement, not the no-fill logic graph,
-and don't reverse reliably from text.
+Scalar options (Toggle / Choice / Range / FreeText and subclasses) convert back with the
+option's own converters. Dict, list and set options are parsed from their joined text and
+kept only if they render back to exactly what the spoiler wrote, so an ambiguous parse is
+dropped rather than guessed. They matter even when they don't gate logic directly: a world
+that draws randomly from one (e.g. weighted minigames) has to see the real value for the
+replayed RNG to make the same picks. Plando options are left at their defaults.
 
 `parse_player_blocks` is pure text (no AP). `resolve_options` needs the AP environment.
 """
@@ -56,22 +57,71 @@ def parse_player_blocks(spoiler_text: str | None) -> dict:
     return blocks
 
 
+def _scalar(text: str):
+    return int(text) if re.fullmatch(r"-?\d+", text) else text
+
+
+def _parse_collection(opt_cls, raw: str):
+    """Parse a dict/list/set option from its spoiler text, or None if it doesn't round-trip."""
+    from Options import OptionDict, OptionList
+
+    parts = raw.split(", ") if raw else []
+    if issubclass(opt_cls, OptionDict):
+        value = {}
+        for part in parts:
+            if ": " not in part:
+                return None
+            key, val = part.rsplit(": ", 1)
+            value[key] = _scalar(val)
+    elif issubclass(opt_cls, OptionList):
+        value = list(parts)
+    else:
+        value = set(parts)
+    valid = getattr(opt_cls, "valid_keys", None)
+    if valid and any(key not in valid for key in value):
+        return None
+    try:
+        if opt_cls.get_option_name(value) != raw:
+            return None
+        opt_cls.from_any(value)  # must construct cleanly
+    except Exception:  # noqa: BLE001 -- unparseable -> leave the option at its default
+        return None
+    # The plain value, not the option's own (a Counter, for counters): the rebuild converts it
+    # with from_any again, and OptionDict only accepts a real dict.
+    return value
+
+
 def resolve_options(world_type, settings: dict) -> dict:
     """Convert a parsed settings block into {option_attr: value} for the given world.
-    Only scalar option types are resolved; anything else is left to its default."""
-    from Options import Toggle, Choice, Range, FreeText  # lazy: needs AP on sys.path
+    Scalar, dict, list and set options are resolved; plando options keep their defaults."""
+    from Options import Toggle, Choice, Range, FreeText, OptionDict, OptionList, OptionSet  # lazy: needs AP
     scalar_types = (Toggle, Choice, Range, FreeText)
+    collection_types = (OptionDict, OptionList, OptionSet)
 
     resolved: dict[str, Any] = {}
     type_hints = getattr(world_type.options_dataclass, "type_hints", {})
     for attr, opt_cls in type_hints.items():
-        if not (isinstance(opt_cls, type) and issubclass(opt_cls, scalar_types)):
+        if not isinstance(opt_cls, type):
             continue
         # Mirror exactly how the spoiler chose the key: display_name, else the attr name.
         spoiler_key = getattr(opt_cls, "display_name", attr)
         if spoiler_key not in settings:
             continue
         raw = settings[spoiler_key]
+        if issubclass(opt_cls, collection_types) and "Plando" not in opt_cls.__name__:
+            value = _parse_collection(opt_cls, raw)
+            if value is not None:
+                resolved[attr] = value
+            continue
+        if not issubclass(opt_cls, scalar_types):
+            continue
+        if issubclass(opt_cls, Choice):
+            # The spoiler writes a choice's display form ("Completely Random", "Defeat Gol And
+            # Maia"), which from_text can't read back; match it against each value's rendering.
+            value = next((v for v in opt_cls.name_lookup if opt_cls.get_option_name(v) == raw), None)
+            if value is not None:
+                resolved[attr] = value
+                continue
         opt = None
         for converter in ("from_any", "from_text"):
             fn = getattr(opt_cls, converter, None)

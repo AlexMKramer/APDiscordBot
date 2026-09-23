@@ -320,13 +320,18 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
             except discord.Forbidden:
                 pass
             return
+        supported = registry['slot_count'] - registry['unsupported']
         summary = (
             f"**Registered seed `{registry['seed']}`** (Archipelago {registry['version']}).\n"
             f"- {registry['slot_count']} slots analyzed\n"
+            f"- {registry.get('exact', 0)} of {supported} supported slots rebuilt exactly as generated\n"
             f"- {registry['verified']} with a full requirement breakdown\n"
             f"- {registry['unsupported']} not supported (those players won't get go-mode tracking)\n"
-            f"Players can now use `/items_to_go_mode`, and I'll DM them when they reach go mode."
         )
+        # Name the unsupported slots: a stale apworld on the server shows up here.
+        for slot in registry.get("unsupported_slots", [])[:10]:
+            summary += f"  - {slot['name']} ({slot['game']}): {slot['reason'][:120]}\n"
+        summary += "Players can now use `/items_to_go_mode`, and I'll DM them when they reach go mode."
         await say(summary)
         # The precompute can run long enough to expire the ephemeral token; DM the owner so the
         # result is never lost.
@@ -1328,11 +1333,11 @@ async def check_go_mode_loop():
         await asyncio.sleep(120)
 
 
-# Process-level guards so a persistence failure can't cause re-DMing, and so unchanged
-# fallback slots aren't rebuilt by the oracle every cycle. Both are keyed with the seed so
-# they self-reset when a new seed is registered.
+# Process-level guards so a persistence failure can't cause re-DMing, and so slots whose
+# inventory hasn't changed aren't rebuilt every cycle. Both are keyed with the seed so they
+# self-reset when a new seed is registered.
 _go_mode_dm_sent = set()       # {(seed, author_id, slot_name)} delivered this process run
-_go_mode_fallback_sig = {}     # {slot_name: (seed, inventory_signature)} last "not yet" check
+_go_mode_checked_sig = {}      # {slot_name: (seed, inventory_signature)} last "not yet" check
 
 
 def _inventory_sig(inv: dict):
@@ -1371,22 +1376,14 @@ async def _run_go_mode_notifications():
         return
 
     items_received = gomode_bot._load_items_received()
-    cache = gomode_bot.load_cache()
 
-    def is_fallback(sn):
-        rec = gomode_bot.slot_for_name(cache, sn) if cache else None
-        return bool(rec and rec.get("status") == "ok"
-                    and not rec.get("requirements", {}).get("verified"))
-
-    # Throttle: a fallback slot can't reach go mode without its inventory changing, and each
-    # check rebuilds its world. Skip fallback slots whose inventory is unchanged since the last
-    # "not yet" result. Verified slots are cheap (in-process) and always checked.
+    # Throttle: a slot can't reach go mode without its inventory changing, and each check
+    # rebuilds its world. Skip slots whose inventory is unchanged since the last "not yet".
     to_check = []
     for sn in candidate_slots:
-        if is_fallback(sn):
-            sig = (seed, _inventory_sig(gomode_bot.inventory_for_slot(items_received, sn)))
-            if _go_mode_fallback_sig.get(sn) == sig:
-                continue
+        sig = (seed, _inventory_sig(gomode_bot.inventory_for_slot(items_received, sn)))
+        if _go_mode_checked_sig.get(sn) == sig:
+            continue
         to_check.append(sn)
     if not to_check:
         return
@@ -1397,9 +1394,9 @@ async def _run_go_mode_notifications():
     for sn in to_check:
         st = status.get(sn, {})
         igm = st.get("in_go_mode")
-        # Remember a definitive "not yet" for fallback slots so we don't rebuild next cycle.
-        if is_fallback(sn) and st.get("status") == "ok" and igm is False:
-            _go_mode_fallback_sig[sn] = (
+        # Remember a definitive "not yet" so we don't rebuild next cycle.
+        if st.get("status") == "ok" and igm is False:
+            _go_mode_checked_sig[sn] = (
                 seed, _inventory_sig(gomode_bot.inventory_for_slot(items_received, sn)))
         if not (st.get("status") == "ok" and igm is True):
             continue

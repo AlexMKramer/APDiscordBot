@@ -130,7 +130,9 @@ async def register_seed(seed_zip: str, *, progress=None) -> dict:
         "version": summary["version"],
         "slot_count": summary["slots"],
         "verified": summary["verified"],
+        "exact": summary.get("exact", 0),
         "unsupported": summary["unsupported"],
+        "unsupported_slots": summary.get("unsupported_slots", []),
         "cache_path": os.path.abspath(CACHE_PATH),
         "ap_path": ap_path,
         "seed_zip": os.path.abspath(seed_zip),
@@ -215,23 +217,8 @@ def _tracker_game_for_slot(items_received: dict, slot_name: str):
     return None
 
 
-_req_mod = None
-
-
-def _satisfies(tree: dict, held: dict) -> bool:
-    """Evaluate a verified requirement tree against held items -- pure Python, no AP needed."""
-    global _req_mod
-    if _req_mod is None:
-        if ANALYZER_DIR not in sys.path:
-            sys.path.insert(0, ANALYZER_DIR)
-        import requirements as _r  # itertools + random only; safe to import in the bot env
-        _req_mod = _r
-    return _req_mod.satisfies(tree, held)
-
-
 async def _oracle_go_mode(ap_path: str, seed_zip: str, slot_inv_map: dict) -> dict:
-    """One fast-path subprocess returning {slot: {status, in_go_mode}} for several slots at once
-    (used for fallback slots, which have no verified tree to evaluate in-process)."""
+    """One fast-path subprocess returning {slot: {status, in_go_mode}} for several slots at once."""
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     fd, tmp = tempfile.mkstemp(suffix=".json", dir=RUNTIME_DIR, prefix="gomode_batch_")
     try:
@@ -251,11 +238,11 @@ async def _oracle_go_mode(ap_path: str, seed_zip: str, slot_inv_map: dict) -> di
 
 
 async def go_mode_status(slot_names, *, items_received: dict | None = None) -> dict:
-    """For each assigned slot name, return {status, in_go_mode, kind, game, reason?}.
+    """For each assigned slot name, return {status, in_go_mode, game, reason?}.
 
-    Verified slots are evaluated instantly in pure Python (satisfies on the cached tree);
-    fallback slots share ONE fast oracle subprocess; unsupported/unregistered slots are
-    reported as such (in_go_mode = None).
+    Every supported slot is checked the way Universal Tracker does it: against its rebuilt
+    world's real logic, in one batched subprocess. Unsupported/unregistered slots are reported
+    as such (in_go_mode = None).
     """
     cache, reg = load_cache(), load_registry()
     if not cache or not reg:
@@ -264,7 +251,7 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
         items_received = _load_items_received()
 
     result: dict = {}
-    fallback_batch: dict = {}
+    batch: dict = {}
     for name in slot_names:
         rec = slot_for_name(cache, name)
         if rec is None:
@@ -284,20 +271,11 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
                             "tracker_game": tracker_game}
             continue
 
-        inv = inventory_for_slot(items_received, name)
-        req = rec.get("requirements", {})
-        if req.get("verified") and req.get("tree"):
-            try:
-                igm = _satisfies(req["tree"], inv)
-            except Exception:  # a corrupt/hand-edited cached tree must not blank the whole call
-                igm = None
-            result[name] = {"status": "ok", "kind": "verified", "game": game, "in_go_mode": igm}
-        else:
-            fallback_batch[name] = inv
-            result[name] = {"status": "ok", "kind": "fallback", "in_go_mode": None, "game": game}
+        batch[name] = inventory_for_slot(items_received, name)
+        result[name] = {"status": "ok", "in_go_mode": None, "game": game}
 
-    if fallback_batch:
-        oracle = await _oracle_go_mode(reg["ap_path"], reg["seed_zip"], fallback_batch)
+    if batch:
+        oracle = await _oracle_go_mode(reg["ap_path"], reg["seed_zip"], batch)
         for name, info in oracle.items():
             if name in result:
                 result[name]["in_go_mode"] = info.get("in_go_mode")

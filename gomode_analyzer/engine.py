@@ -23,6 +23,7 @@ from typing import Optional
 # The generation stages that build a world's logic graph + item pool, stopping
 # before fill (distribute_items_restrictive) so regular locations stay empty. Event
 # / Victory locations are placed deterministically by create_items/generate_basic.
+# Same list Universal Tracker runs.
 BUILD_STEPS = (
     "generate_early",
     "create_regions",
@@ -52,6 +53,9 @@ class SlotResult:
     progression_pool: int = 0
     unknown_inventory: list[str] = field(default_factory=list)
     options_source: str = ""          # where the resolved options came from
+    regen: str = ""                   # how the world was rebuilt: seed / seed+ut(...) / ut(...)
+                                      # "seed" = the world's real RNG was replayed
+    mismatch: Optional[int] = None    # differences from the seed's record of the slot (0 = exact)
     # Structured view of items_needed: which are strictly required vs "N of a group".
     requirements: dict = field(default_factory=dict)
 
@@ -68,6 +72,8 @@ class SlotResult:
             "progression_pool": self.progression_pool,
             "unknown_inventory": self.unknown_inventory,
             "options_source": self.options_source,
+            "regen": self.regen,
+            "mismatch": self.mismatch,
         }
 
 
@@ -84,35 +90,247 @@ def _describe_source(slot_data_opts: dict, spoiler_opts: dict) -> str:
     return "+".join(parts)
 
 
-def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[int] = None,
-                 name: str = "", spoiler_settings: Optional[dict] = None,
-                 precollected: Optional[list] = None, fast: bool = False) -> SlotResult:
-    """Analyze one slot.
+def _build_multiworld(world_type, options: dict, player_name: str, passthrough, rng=None):
+    """One no-fill generation of a single slot, the way Universal Tracker's TMain does it:
+    flagged as fake generation, and with the seed's slot data handed back to the world when
+    it supports UT regeneration (`re_gen_passthrough`).
 
-    `options` is the slot's resolved slot_data options (may be empty). `spoiler_settings`
-    is the raw {display name: value} block parsed from the spoiler, used to recover
-    options the world didn't put in slot_data. slot_data values win where both exist.
-    `inventory` is {item_name: count}. Missing options fall back to world defaults.
+    `rng` is (generation seed, slot, players). With it the world gets the same RNG it had in
+    the real generation, so its random choices (which weapons are progression, shuffled
+    entrances, rolled counts) come out the same even for worlds without UT support."""
+    from argparse import Namespace
+    from random import Random
+    from BaseClasses import CollectionState, MultiWorld
+    from worlds.AutoWorld import World, call_all
+    from worlds.generic.Rules import exclusion_rules
 
-    `fast=True` returns as soon as the go-mode boolean is known, skipping the expensive
-    minimization + requirement decomposition. Used by the go-mode notification loop, which
-    only needs `in_go_mode` (the same build + guardrails still run, so the answer is exact).
-    """
+    multiworld = MultiWorld(1)
+    multiworld.generation_is_fake = True
+    if passthrough is not None:
+        multiworld.re_gen_passthrough = {world_type.game: passthrough}
+    # UT's "off" mode: every entrance gets connected. We have no found-entrance data, and
+    # go mode means beatable with full knowledge, so nothing stays deferred.
+    multiworld.enforce_deferred_connections = "off"
+    multiworld.set_seed(rng[0] if rng else 0)
+    multiworld.game = {1: world_type.game}
+    multiworld.player_name = {1: player_name or "Player1"}
+    args = Namespace()
+    for key, option in world_type.options_dataclass.type_hints.items():
+        setattr(args, key, {1: option.from_any(options.get(key, option.default))})
+    multiworld.set_options(args)
+    if rng:
+        # Real generation seeds the multiworld RNG with the seed, then each world, in player
+        # order, takes Random(multiworld.random.getrandbits(64)). Replay the slot's own draw,
+        # and leave the multiworld RNG where it was once every world had drawn.
+        gen_seed, slot, players = rng
+        draws = Random(gen_seed)
+        for _ in range(slot - 1):
+            draws.getrandbits(64)
+        multiworld.worlds[1].random = Random(draws.getrandbits(64))
+        for _ in range(max(players, slot) - 1):
+            multiworld.random.getrandbits(64)
+    multiworld.state = CollectionState(multiworld)
+    for step in BUILD_STEPS:
+        if not hasattr(World, step):
+            continue
+        call_all(multiworld, step)
+        if step == "set_rules":
+            exclude = getattr(multiworld.worlds[1].options, "exclude_locations", None)
+            if exclude is not None:
+                exclusion_rules(multiworld, 1, exclude.value)
+    return multiworld
+
+
+def _regen_like_ut(world_type, options: dict, player_name: str, slot_data: dict, rng=None):
+    """Rebuild a slot the way Universal Tracker does, so worlds that randomize their logic
+    structure during generation (regions, chapter order, entrances, goal counts) reproduce
+    this seed's structure instead of whatever seed 0 rolls.
+
+    Mirrors UT's regen: yaml-less worlds get the raw slot_data as the passthrough, then any
+    world with interpret_slot_data is rebuilt with what it returns. Returns (multiworld, how)."""
+    import inspect
+
+    static_isd = isinstance(inspect.getattr_static(world_type, "interpret_slot_data", None),
+                            (staticmethod, classmethod))
+    base = slot_data if (slot_data and getattr(world_type, "ut_can_gen_without_yaml", False)) else None
+    base_how = "slot_data" if base is not None else "none"
+
+    if static_isd:
+        interpreted = world_type.interpret_slot_data(slot_data) if slot_data else None
+        if interpreted:
+            multiworld = _build_multiworld(world_type, options, player_name, interpreted, rng)
+            return multiworld, "interpret_slot_data"
+        return _build_multiworld(world_type, options, player_name, base, rng), base_how
+
+    multiworld = _build_multiworld(world_type, options, player_name, base, rng)
+    isd = getattr(multiworld.worlds[1], "interpret_slot_data", None)
+    if slot_data and callable(isd):
+        interpreted = isd(slot_data)
+        if interpreted:
+            multiworld = _build_multiworld(world_type, options, player_name, interpreted, rng)
+            return multiworld, "interpret_slot_data"
+    return multiworld, base_how
+
+
+@dataclass
+class PreparedSlot:
+    """A slot's rebuilt world, ready for any number of go-mode checks."""
+    multiworld: object
+    world_type: type
+    universe: list          # every progression Item the player can ever hold (pool + start items)
+    prog_names: set         # names that are progression somewhere in the universe
+    templates: dict         # item name -> an Item the rebuild made, for worlds without create_item
+
+
+def _make_item(world, name: str, templates: dict):
+    """A new Item by name. Some worlds (Gamer Connections) never implement create_item and build
+    their items directly, so fall back to copying one the rebuild already made."""
+    import copy
+    try:
+        return world.create_item(name)
+    except NotImplementedError:
+        if name not in templates:
+            raise
+        item = copy.copy(templates[name])
+        item.location = None
+        return item
+
+
+def _finish(multiworld, world_type, precollected):
+    """Turn a rebuilt multiworld into a PreparedSlot, or return (None, reason) if it fails a
+    guardrail. Strips start items (the tracker inventory supplies them) and collects the
+    universe of progression items the player can ever hold."""
+    from BaseClasses import CollectionState
+
+    player = 1  # solo multiworld
+    world = multiworld.worlds[player]
+    templates = {}
+    for item in [*multiworld.itempool, *multiworld.precollected_items[player],
+                 *(loc.item for loc in multiworld.get_locations(player) if loc.item)]:
+        templates.setdefault(item.name, item)
+
+    # Start inventory: the tracker's received list already includes it (the web tracker adds
+    # the multidata's precollected items to every inventory), so like UT we strip every real
+    # start item from the rebuilt world and let the inventory supply it. Only events stay.
+    world_start = [it for it in multiworld.precollected_items[player] if it.code is not None]
+    multiworld.precollected_items[player] = [it for it in multiworld.precollected_items[player]
+                                             if it.code is None]
+
+    # Guardrail 1: the world must define a real goal. The default completion_condition
+    # is `lambda state: True`; if an empty state already "beats" the game, the goal was
+    # never set (or this world needs setup we skipped), so we must not claim go-mode.
+    if multiworld.can_beat_game(CollectionState(multiworld)):
+        return None, "World has no gating goal in logic (cannot determine go-mode reliably)."
+
+    # Everything the player can ever hold: the item pool plus their start inventory (the
+    # world's own start items, plus yaml/randomized start inventory from the multidata).
+    start_items = list(world_start)
+    already = Counter(it.code for it in world_start)
+    id_to_name = getattr(world_type, "item_id_to_name", {}) or {}
+    for code in precollected or []:
+        code_i = int(code) if str(code).lstrip("-").isdigit() else code
+        if already.get(code_i, 0) > 0:
+            already[code_i] -= 1
+            continue
+        item_name = id_to_name.get(code_i)
+        if not item_name:
+            continue
+        try:
+            start_items.append(_make_item(world, item_name, templates))
+        except Exception:  # noqa: BLE001 -- a start item we can't reconstruct is simply skipped
+            pass
+    universe = [item for item in multiworld.itempool if item.advancement]
+    universe += [item for item in start_items if item.advancement]
+
+    def beats_with(items):
+        state = CollectionState(multiworld)
+        for item in items:
+            state.collect(item, prevent_sweep=True)
+        return multiworld.can_beat_game(state)
+
+    # Guardrail 2: holding everything must beat the game. Some worlds place key items themselves
+    # in pre_fill (Ship of Harkinian's songs, dungeon rewards and keys), which we stop before,
+    # so if the pool alone falls short, add the world's pre-fill items the way AP's fill counts
+    # them. (Only then: other worlds' pre-fill lists repeat items already in the pool.)
+    if not beats_with(universe):
+        try:
+            universe += [item for item in world.get_pre_fill_items() if item.advancement]
+        except Exception:  # noqa: BLE001 -- a world whose pre-fill list needs pre_fill state
+            pass
+        if not beats_with(universe):
+            # Still short: our reconstruction is missing something. Don't guess.
+            return None, ("Goal is unreachable even with every progression item -- the logic "
+                          "reconstruction is incomplete.")
+
+    return PreparedSlot(multiworld=multiworld, world_type=world_type, universe=universe,
+                        prog_names={item.name for item in universe}, templates=templates), ""
+
+
+def _mismatch(multiworld, expected_locations: set, expected_prog: Counter) -> int:
+    """How far a rebuilt slot is from what the real generation recorded: its location IDs, and
+    the progression items it owns (placed anywhere). 0 means the same world."""
+    world = multiworld.worlds[1]
+    locations = [loc for loc in multiworld.get_locations(1) if loc.address is not None]
+    ours = Counter(item.code for item in multiworld.itempool
+                   if item.advancement and item.code is not None)
+    ours += Counter(loc.item.code for loc in locations
+                    if loc.item and loc.item.advancement and loc.item.code is not None)
+    # Items a world places in its own pre_fill (which we don't run) are either separate from
+    # the pool or drawn from it, depending on the world; take whichever reading matches.
+    try:
+        pre_fill = Counter(item.code for item in world.get_pre_fill_items()
+                           if item.advancement and item.code is not None)
+    except Exception:  # noqa: BLE001
+        pre_fill = Counter()
+    # Real generation moves start_inventory_from_pool items out of the pool, which we don't do.
+    from_pool = getattr(world.options, "start_inventory_from_pool", None)
+    if from_pool:
+        ours -= Counter({world.item_name_to_id[name]: count for name, count in from_pool.value.items()
+                         if name in world.item_name_to_id})
+    location_diff = len({loc.address for loc in locations} ^ set(expected_locations))
+    item_diff = min(sum(((held - expected_prog) + (expected_prog - held)).values())
+                    for held in (ours, ours + pre_fill))
+    return location_diff + item_diff
+
+
+def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: str = "",
+                 spoiler_settings: Optional[dict] = None, precollected: Optional[list] = None,
+                 slot_data: Optional[dict] = None, datapackage_checksum: Optional[str] = None,
+                 gen_seed: Optional[int] = None, players: int = 0,
+                 expected_locations: Optional[set] = None, expected_prog: Optional[Counter] = None,
+                 result: Optional[SlotResult] = None):
+    """Rebuild one slot's logic. Returns (PreparedSlot or None, SlotResult); on None the result
+    carries the unsupported/error status and reason.
+
+    With the seed's record of the slot (`expected_locations`, `expected_prog`), each way of
+    rebuilding is checked against it and the first exact match is used."""
     # Lazy AP imports -- the caller is responsible for putting the (version-pinned) AP
     # source on sys.path before calling this.
-    from BaseClasses import CollectionState
     from worlds.AutoWorld import AutoWorldRegister
-    from test.general import setup_multiworld
     import spoiler_options
 
-    result = SlotResult(slot=slot, name=name or "", game=game, status="error")
+    result = result or SlotResult(slot=None, name=name or "", game=game, status="error")
 
     world_type = AutoWorldRegister.world_types.get(game)
     if world_type is None:
         result.status = "unsupported"
         result.reason = (f"World '{game}' is not loaded. Its apworld may be missing or "
                          f"built for a different Archipelago version.")
-        return result
+        return None, result
+    if getattr(world_type, "disable_ut", False):
+        result.status = "unsupported"
+        result.reason = "The world's author has disabled tracker regeneration for this game."
+        return None, result
+
+    # The installed apworld must be the one that generated the seed. A different version can
+    # have different logic, and would silently answer with the wrong rules.
+    if datapackage_checksum:
+        installed = world_type.get_data_package_data().get("checksum")
+        if installed != datapackage_checksum:
+            result.status = "unsupported"
+            result.reason = ("The installed apworld doesn't match the one that generated this seed "
+                             "(datapackage checksum differs). Install the same apworld version.")
+            return None, result
 
     # Resolve options: spoiler-recovered as a base, slot_data overriding it (slot_data is
     # exact/typed; the spoiler is parsed from text). Anything still missing -> world default.
@@ -122,85 +340,78 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
 
     # A spoiler-recovered value can occasionally break the build (a mis-converted option).
     # Try the richest option set first, then fall back to slot_data-only, then defaults,
-    # so Phase 2 never regresses below "the world at least builds".
+    # so the world at least builds.
     attempts = [(merged, _describe_source(slot_data_opts, spoiler_opts))]
     if slot_data_opts and slot_data_opts != merged:
         attempts.append((slot_data_opts, "slot_data only (spoiler dropped: build failed)"))
     attempts.append(({}, "defaults (recovered options dropped: build failed)"))
 
-    multiworld = None
-    last_exc = None
-    for opts, source in attempts:
-        try:
-            multiworld = setup_multiworld(world_type, steps=BUILD_STEPS, seed=0, options=opts)
-            result.options_source = source
-            break
-        except Exception as exc:  # noqa: BLE001 -- try the next, less-faithful option set
-            last_exc = exc
-    if multiworld is None:
-        result.status = "error"
-        result.reason = f"Failed to build logic: {type(last_exc).__name__}: {last_exc}"
-        return result
+    # Ways to rebuild, most faithful first. With the generation seed the world replays its real
+    # RNG and runs exactly the code the real generation ran. UT's slot data passthrough covers
+    # what that can't (settings the spoiler doesn't carry) but switches some worlds onto their
+    # UT code path, and without the seed it's all UT itself has.
+    rng = (gen_seed, slot, players) if gen_seed is not None and slot else None
+    candidates = []
+    if rng:
+        candidates += [("seed", rng, {}), ("seed+ut", rng, slot_data or {})]
+    candidates.append(("ut", None, slot_data or {}))
+    checkable = bool(expected_locations or expected_prog)
 
-    player = 1  # solo multiworld
-
-    # Guardrail 1: the world must define a real goal. The default completion_condition
-    # is `lambda state: True`; if an empty state already "beats" the game, the goal was
-    # never set (or this world needs setup we skipped), so we must not claim go-mode.
-    # NOTE: run this BEFORE crediting start inventory, so a slot with a generous start
-    # inventory can't be misread as having no gating goal.
-    try:
-        if multiworld.can_beat_game(CollectionState(multiworld)):
-            result.status = "unsupported"
-            result.reason = "World has no gating goal in logic (cannot determine go-mode reliably)."
-            return result
-    except Exception as exc:  # noqa: BLE001
-        result.status = "error"
-        result.reason = f"Goal check failed: {type(exc).__name__}: {exc}"
-        return result
-
-    prog_pool = [item for item in multiworld.itempool if item.advancement]
-    result.progression_pool = len(prog_pool)
-
-    # Guardrail 2: collecting the entire progression pool must beat the game. If it
-    # doesn't, our reconstruction is missing something (classically: entrance
-    # randomization whose real connections we don't have). Don't guess.
-    full_state = CollectionState(multiworld)
-    for item in prog_pool:
-        full_state.collect(item, prevent_sweep=True)
-    if not multiworld.can_beat_game(full_state):
-        result.status = "unsupported"
-        result.reason = ("Goal is unreachable even with every progression item -- the "
-                         "logic reconstruction is incomplete (often entrance randomization). "
-                         "Faithful support needs the seed's entrance data.")
-        return result
-
-    # Credit the slot's ACTUAL start inventory (after the guardrails). setup_multiworld runs
-    # the world stages but NOT core generation's start-inventory step, so a world's own
-    # push_precollected is included, yet yaml start_inventory / start_inventory_from_pool (and
-    # randomized start inventory) are not. Inject the multidata's ground-truth precollected for
-    # anything the rebuild didn't already credit, so go-mode + requirements account for items
-    # the player holds from the start.
-    if precollected:
-        world = multiworld.worlds[player]
-        id_to_name = getattr(world_type, "item_id_to_name", {}) or {}
-        already = Counter(getattr(it, "code", None) for it in multiworld.precollected_items[player])
-        for code in precollected:
-            code_i = int(code) if str(code).lstrip("-").isdigit() else code
-            if already.get(code_i, 0) > 0:
-                already[code_i] -= 1   # the world already granted this start item
-                continue
-            item_name = id_to_name.get(code_i)
-            if not item_name:
-                continue
+    best = None      # (mismatch, PreparedSlot, label, source)
+    failures = []
+    for label, cand_rng, cand_slot_data in candidates:
+        for opts, source in attempts:
             try:
-                multiworld.push_precollected(world.create_item(item_name))
-            except Exception:  # noqa: BLE001 -- a start item we can't reconstruct is simply skipped
-                pass
+                multiworld, how = _regen_like_ut(world_type, opts, name, cand_slot_data, cand_rng)
+                prepared, why = _finish(multiworld, world_type, precollected)
+            except Exception as exc:  # noqa: BLE001 -- try the next, less-faithful option set
+                failures.append(f"{label}: {type(exc).__name__}: {exc}")
+                continue
+            if prepared is None:
+                failures.append(f"{label}: {why}")
+                break
+            mismatch = (_mismatch(prepared.multiworld, expected_locations or set(),
+                                  expected_prog or Counter()) if checkable else None)
+            tag = label if how == "none" or label == "seed" else f"{label}({how})"
+            if best is None or (mismatch is not None and mismatch < best[0]):
+                best = (mismatch, prepared, tag, source)
+            break
+        if best is not None and not best[0]:
+            break  # an exact match (or nothing to check against): take it
 
-    # Seed the player's current inventory directly into a fresh state (now also carrying the
-    # injected start inventory via CollectionState's precollected auto-collect).
-    current = CollectionState(multiworld)
+    if best is None:
+        # Nothing built past the guardrails. Report the most faithful attempt's reason.
+        reason = failures[0] if failures else "no rebuild succeeded"
+        result.status = "error" if "Error" in reason or "Exception" in reason else "unsupported"
+        result.reason = reason.split(": ", 1)[1] if ": " in reason else reason
+        return None, result
+
+    mismatch, prepared, tag, source = best
+    if mismatch and source.startswith("defaults"):
+        # The real settings didn't build, and a default-settings world is a different game.
+        result.status = "unsupported"
+        result.reason = ("The slot's settings didn't rebuild, and a default-settings rebuild doesn't "
+                         f"match the seed ({failures[0] if failures else 'no detail'}).")
+        return None, result
+    # Some worlds settle which copies are progression after generate_basic. The seed says which
+    # names were progression for this slot; count those too, as UT does with the server's flags.
+    id_to_name = getattr(world_type, "item_id_to_name", {}) or {}
+    prepared.prog_names |= {id_to_name[code] for code in (expected_prog or {}) if code in id_to_name}
+    result.status = "ok"
+    result.regen = tag
+    result.options_source = source
+    result.mismatch = mismatch
+    result.progression_pool = len(prepared.universe)
+    return prepared, result
+
+
+def inventory_state(prepared: PreparedSlot, inventory: dict):
+    """A CollectionState holding the player's inventory ({item_name: count}), built the way UT
+    builds it. Returns (state, unknown_item_names)."""
+    from BaseClasses import CollectionState, ItemClassification
+
+    world = prepared.multiworld.worlds[1]
+    state = CollectionState(prepared.multiworld)
     unknown = []
     for item_name, count in inventory.items():
         try:
@@ -209,17 +420,61 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
             count = 0
         if count <= 0:
             continue
-        if item_name not in world_type.item_name_to_id:
+        if item_name not in prepared.world_type.item_name_to_id:
             unknown.append(item_name)
             continue
-        world = multiworld.worlds[player]
         for _ in range(count):
-            current.collect(world.create_item(item_name), prevent_sweep=True)
-    result.unknown_inventory = unknown
+            try:
+                item = _make_item(world, item_name, prepared.templates)
+            except Exception:  # noqa: BLE001 -- can't make it at all: report it, don't guess
+                unknown.append(item_name)
+                break
+            # UT ORs in the server's item flags. The tracker page doesn't carry them per copy,
+            # so any copy of a name that's progression for this slot counts: in the game, every
+            # copy you hold works (e.g. any 16 strawberries finish Celeste 64, even though the
+            # generator only flagged 16 specific copies as progression).
+            if not item.advancement and item_name in prepared.prog_names:
+                item.classification |= ItemClassification.progression
+            state.collect(item, prevent_sweep=True)
+    return state, unknown
 
-    # Are they already in go-mode?
+
+def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[int] = None,
+                 name: str = "", spoiler_settings: Optional[dict] = None,
+                 precollected: Optional[list] = None, slot_data: Optional[dict] = None,
+                 datapackage_checksum: Optional[str] = None, gen_seed: Optional[int] = None,
+                 players: int = 0, expected_locations: Optional[set] = None,
+                 expected_prog: Optional[Counter] = None, fast: bool = False) -> SlotResult:
+    """Analyze one slot.
+
+    `options` is the slot's resolved slot_data options (may be empty). `spoiler_settings`
+    is the raw {display name: value} block parsed from the spoiler, used to recover
+    options the world didn't put in slot_data. slot_data values win where both exist.
+    `slot_data` is the slot's full slot data, handed to the world for UT-style regeneration.
+    `gen_seed`/`players` (from the spoiler) let the slot's world replay its real RNG, and
+    `expected_locations`/`expected_prog` (from the multidata) check the rebuild against it.
+    `inventory` is {item_name: count}, as the tracker shows it (start inventory included).
+
+    `fast=True` returns as soon as the go-mode boolean is known, skipping the expensive
+    minimization + requirement decomposition. Used by the go-mode notification loop, which
+    only needs `in_go_mode` (the same build + guardrails still run, so the answer is exact).
+    """
+    result = SlotResult(slot=slot, name=name or "", game=game, status="error")
+    prepared, result = prepare_slot(game, options, slot=slot, name=name,
+                                    spoiler_settings=spoiler_settings, precollected=precollected,
+                                    slot_data=slot_data, datapackage_checksum=datapackage_checksum,
+                                    gen_seed=gen_seed, players=players,
+                                    expected_locations=expected_locations,
+                                    expected_prog=expected_prog, result=result)
+    if prepared is None:
+        return result
+
+    multiworld = prepared.multiworld
+    current, result.unknown_inventory = inventory_state(prepared, inventory)
+
+    # Are they already in go-mode? UT's test: what they hold, plus a sweep of their own event
+    # (and locked) locations, against the goal.
     if multiworld.can_beat_game(current):
-        result.status = "ok"
         result.in_go_mode = True
         result.items_needed = []
         return result
@@ -227,12 +482,11 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
     # Not yet -- find a minimal set of still-needed progression items, then classify each
     # as strictly required vs interchangeable ("N of a group") so the bot doesn't present a
     # fungible pick (e.g. one of many worlds) as if it were mandatory.
-    result.status = "ok"
     result.in_go_mode = False
     if fast:
         # Notification fast-path: the caller only needs the go-mode boolean.
         return result
-    remaining = _remaining_pool(prog_pool, inventory)
+    remaining = _remaining_pool(prepared.universe, inventory)
 
     if len(remaining) > MAX_MINIMIZATION_ITEMS:
         # Safety valve: don't attempt an unbounded minimization. Report the whole
@@ -254,7 +508,7 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
     # Discover a full requirement tree (routes + N-of-group), then trust it only if it
     # provably reproduces the can_beat_game oracle on random item-sets.
     import requirements
-    world = multiworld.worlds[player]
+    world = multiworld.worlds[1]
     tree, verified = requirements.discover(multiworld.can_beat_game, current, remaining,
                                            getattr(world, "item_name_groups", {}) or {})
     if verified and tree is not None:

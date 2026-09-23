@@ -92,9 +92,8 @@ def main(argv=None) -> int:
                     go_mode[selector] = {"status": "error", "reason": "slot not found"}
                     continue
                 try:
-                    res = engine.analyze_slot(sd.game, sd.options, inv or {}, slot=sd.slot,
-                                              name=sd.name, spoiler_settings=sd.spoiler_settings,
-                                              precollected=sd.precollected, fast=True)
+                    res = engine.analyze_slot(sd.game, sd.options, inv or {},
+                                              **seed.engine_kwargs(sd), fast=True)
                     go_mode[selector] = {"status": res.status, "in_go_mode": res.in_go_mode,
                                          "reason": res.reason}
                 except Exception as exc:  # noqa: BLE001 -- one bad slot must not abort the batch
@@ -104,9 +103,7 @@ def main(argv=None) -> int:
             rows = []
             for sid, sd in seed.slots.items():
                 try:
-                    res = engine.analyze_slot(sd.game, sd.options, {}, slot=sid, name=sd.name,
-                                              spoiler_settings=sd.spoiler_settings,
-                                              precollected=sd.precollected)
+                    res = engine.analyze_slot(sd.game, sd.options, {}, **seed.engine_kwargs(sd))
                     rows.append(res.to_dict())
                 except Exception as exc:  # noqa: BLE001 -- never let one slot abort the survey
                     rows.append({"slot": sid, "name": sd.name, "game": sd.game,
@@ -126,9 +123,7 @@ def main(argv=None) -> int:
                         inventory = json.load(fh)
                 else:
                     inventory = json.loads(inv_arg)
-                res = engine.analyze_slot(sd.game, sd.options, inventory, slot=sd.slot, name=sd.name,
-                                          spoiler_settings=sd.spoiler_settings,
-                                          precollected=sd.precollected)
+                res = engine.analyze_slot(sd.game, sd.options, inventory, **seed.engine_kwargs(sd))
                 output = res.to_dict()
                 output["seed"] = seed.seed_name
                 output["version"] = seed.version_str
