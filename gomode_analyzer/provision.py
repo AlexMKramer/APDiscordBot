@@ -85,6 +85,21 @@ def materialize_ap_source(version: tuple, dest: str, *, ap_repo: str | None = No
     return dest
 
 
+def _fix_separators(path: str) -> None:
+    """Rewrite an apworld zipped with Windows backslashes in its entry names ("pkg\\__init__.py").
+    Windows tolerates them, but Linux's zipimport can't find the package, so the world silently
+    fails to load."""
+    with zipfile.ZipFile(path) as zf:
+        if not any("\\" in info.orig_filename for info in zf.infolist()):
+            return
+        entries = [(info.orig_filename.replace("\\", "/"), zf.read(info)) for info in zf.infolist()]
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+        for name, data in entries:
+            out.writestr(name, data)
+    os.replace(tmp, path)
+
+
 def _apworld_module(path: str) -> tuple[str | None, bool]:
     """(top-level package name, has Python source) for an .apworld file."""
     with zipfile.ZipFile(path) as zf:
@@ -128,6 +143,7 @@ def install_apworlds(apworlds_src: str, ap_path: str) -> tuple[list[str], list[s
     installed, skipped = [], []
     for fn in staged:
         path = os.path.join(target, fn)
+        _fix_separators(path)
         module, has_source = _apworld_module(path)
         if not has_source:
             os.remove(path)

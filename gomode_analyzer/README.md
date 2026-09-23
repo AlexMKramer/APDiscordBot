@@ -49,7 +49,9 @@ This writes `runtime/ap-<version>/` and `runtime/manifest.json`. As in the launc
 apworld replaces the built-in world of the same name: the tree's `worlds/<name>` folder is
 moved to `shadowed_worlds/`, since in a source tree it would otherwise load first and win. An
 apworld with only compiled bytecode (a copy of a launcher's built-in world) can't load under
-another Python version, so it's skipped and listed under `apworlds_skipped_no_source`. The AP env still needs an
+another Python version, so it's skipped and listed under `apworlds_skipped_no_source`. An
+apworld zipped with Windows backslashes in its entry names is rewritten with forward
+slashes, since Linux can't import it otherwise. The AP env still needs an
 interpreter with AP's runtime deps (PyYAML, schema, jellyfish, …); point the analyzer at
 one. A dedicated `--build-venv` step is a future addition; for now reuse an AP venv.
 
