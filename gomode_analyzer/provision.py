@@ -85,24 +85,59 @@ def materialize_ap_source(version: tuple, dest: str, *, ap_repo: str | None = No
     return dest
 
 
-def install_apworlds(apworlds_src: str, ap_path: str) -> list[str]:
-    """Copy .apworld files from a directory or zip into <ap_path>/custom_worlds/."""
+def _apworld_module(path: str) -> tuple[str | None, bool]:
+    """(top-level package name, has Python source) for an .apworld file."""
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+    tops = {n.split("/")[0] for n in names if "/" in n}
+    return (tops.pop() if len(tops) == 1 else None), any(n.endswith(".py") for n in names)
+
+
+def install_apworlds(apworlds_src: str, ap_path: str) -> tuple[list[str], list[str]]:
+    """Copy .apworld files from a directory or zip into <ap_path>/custom_worlds/, the way the
+    launcher treats them: an apworld replaces the built-in world of the same name.
+
+    In a source tree the built-in worlds/<name> folder would load first and silently win, so
+    it's moved to shadowed_worlds/. An apworld with only compiled bytecode (a copy of the
+    launcher's own built-in worlds) can't load under a different Python, so it's skipped and
+    the built-in world stays. Returns (installed, skipped)."""
     target = os.path.join(ap_path, "custom_worlds")
+    shadowed = os.path.join(ap_path, "shadowed_worlds")
+    worlds_dir = os.path.join(ap_path, "worlds")
     os.makedirs(target, exist_ok=True)
-    installed = []
+
+    # Start from the stock tree each time, so re-provisioning only reflects the current set.
+    if os.path.isdir(shadowed):
+        for name in os.listdir(shadowed):
+            shutil.move(os.path.join(shadowed, name), os.path.join(worlds_dir, name))
+
+    staged = []
     if os.path.isdir(apworlds_src):
         for fn in os.listdir(apworlds_src):
             if fn.endswith(".apworld"):
                 shutil.copy2(os.path.join(apworlds_src, fn), os.path.join(target, fn))
-                installed.append(fn)
+                staged.append(fn)
     elif zipfile.is_zipfile(apworlds_src):
         with zipfile.ZipFile(apworlds_src) as zf:
             for info in zf.infolist():
                 if info.filename.endswith(".apworld"):
                     info.filename = os.path.basename(info.filename)
                     zf.extract(info, target)
-                    installed.append(info.filename)
-    return installed
+                    staged.append(info.filename)
+
+    installed, skipped = [], []
+    for fn in staged:
+        path = os.path.join(target, fn)
+        module, has_source = _apworld_module(path)
+        if not has_source:
+            os.remove(path)
+            skipped.append(fn)
+            continue
+        installed.append(fn)
+        if module and os.path.isdir(os.path.join(worlds_dir, module)):
+            os.makedirs(shadowed, exist_ok=True)
+            shutil.move(os.path.join(worlds_dir, module), os.path.join(shadowed, module))
+    return installed, skipped
 
 
 def provision(seed_zip: str, runtime_dir: str, *, apworlds_src: str | None = None,
@@ -111,13 +146,14 @@ def provision(seed_zip: str, runtime_dir: str, *, apworlds_src: str | None = Non
     tag = ".".join(str(p) for p in version)
     ap_path = os.path.join(runtime_dir, f"ap-{tag}")
     materialize_ap_source(version, ap_path, ap_repo=ap_repo)
-    installed = install_apworlds(apworlds_src, ap_path) if apworlds_src else []
+    installed, skipped = install_apworlds(apworlds_src, ap_path) if apworlds_src else ([], [])
 
     manifest = {
         "seed_zip": os.path.abspath(seed_zip),
         "version": tag,
         "ap_path": os.path.abspath(ap_path),
         "apworlds_installed": sorted(installed),
+        "apworlds_skipped_no_source": sorted(skipped),
     }
     os.makedirs(runtime_dir, exist_ok=True)
     with open(os.path.join(runtime_dir, "manifest.json"), "w", encoding="utf-8") as fh:
