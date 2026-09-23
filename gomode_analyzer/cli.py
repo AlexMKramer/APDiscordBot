@@ -10,6 +10,9 @@ Examples:
 
   # survey every slot with empty inventory (validation / coverage)
   python cli.py --ap-path <AP> --seed-zip TEST-SEED.zip --survey
+
+  # every slot's item classification (the bot uses it to hide filler in the item feed)
+  python cli.py --ap-path <AP> --seed-zip TEST-SEED.zip --item-flags
 """
 from __future__ import annotations
 
@@ -67,6 +70,8 @@ def main(argv=None) -> int:
     parser.add_argument("--go-mode-batch",
                         help='Fast go-mode check for many slots at once: JSON (or @path) '
                              '{slot: inventory} -> {go_mode: {slot: {status, in_go_mode}}}')
+    parser.add_argument("--item-flags", action="store_true",
+                        help="Print every slot's {item name: flags} from the seed (0 = filler)")
     args = parser.parse_args(argv)
 
     # Do all AP work with stdout muted, build the result, then print clean JSON.
@@ -78,7 +83,11 @@ def main(argv=None) -> int:
 
         seed = seed_data.load_seed(args.seed_zip)
 
-        if args.go_mode_batch:
+        if args.item_flags:
+            output = {"seed": seed.seed_name,
+                      "item_flags": {sd.name: {"game": sd.game, "items": sd.item_flags}
+                                     for sd in seed.slots.values()}}
+        elif args.go_mode_batch:
             spec = args.go_mode_batch
             if spec.startswith("@"):
                 with open(spec[1:], "r", encoding="utf-8") as fh:

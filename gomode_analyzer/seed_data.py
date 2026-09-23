@@ -31,6 +31,7 @@ class SlotData:
     # What the real generation produced for this slot, to check a rebuild against:
     location_ids: set = field(default_factory=set)        # the slot's real location IDs
     prog_item_ids: Counter = field(default_factory=Counter)  # its progression items placed anywhere
+    item_flags: dict = field(default_factory=dict)        # item name -> flags of all its copies OR'd
 
 
 @dataclass
@@ -79,6 +80,12 @@ def _read_multidata(zip_path: str):
     return decoded, spoiler
 
 
+def _names(id_flags: dict, package: dict) -> dict:
+    """{item_id: flags} -> {item_name: flags}, using the game's datapackage from the seed."""
+    id_to_name = {item_id: name for name, item_id in package.get("item_name_to_id", {}).items()}
+    return {id_to_name[item_id]: flags for item_id, flags in id_flags.items() if item_id in id_to_name}
+
+
 def load_seed(zip_path: str) -> SeedData:
     import spoiler_options  # pure text parsing, no AP needed
 
@@ -90,14 +97,18 @@ def load_seed(zip_path: str) -> SeedData:
     datapackage = decoded.get("datapackage", {}) or {}
     blocks = spoiler_options.parse_player_blocks(spoiler)
 
-    # locations: {slot: {location_id: (item_id, receiving_slot, flags)}}; flag 0b1 = progression.
+    # locations: {slot: {location_id: (item_id, receiving_slot, flags)}}; flags: 0b1 progression,
+    # 0b10 useful, 0b100 trap, 0 filler.
     location_ids: dict = {}
     prog_item_ids: dict = {}
+    item_id_flags: dict = {}   # receiving slot -> {item_id: flags of every copy OR'd together}
     for sid, locs in (decoded.get("locations", {}) or {}).items():
         location_ids[sid] = set(locs)
         for item_id, receiver, flags in locs.values():
             if flags & 0b1:
                 prog_item_ids.setdefault(receiver, Counter())[item_id] += 1
+            per_slot = item_id_flags.setdefault(receiver, {})
+            per_slot[item_id] = per_slot.get(item_id, 0) | flags
 
     slots = {}
     for sid, info in slot_info.items():
@@ -115,6 +126,7 @@ def load_seed(zip_path: str) -> SeedData:
             datapackage=datapackage.get(game) or {},
             location_ids=location_ids.get(sid, set()),
             prog_item_ids=prog_item_ids.get(sid, Counter()),
+            item_flags=_names(item_id_flags.get(sid, {}), datapackage.get(game) or {}),
         )
 
     # The spoiler header carries the generation seed ("Archipelago Version X  -  Seed: N"). With

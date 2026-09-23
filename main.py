@@ -946,6 +946,19 @@ async def no_dm_tracker(tracker_url, auth):
         await asyncio.sleep(60)
 
 
+async def _hide_filler(diff):
+    """The feed's diff without filler items, per the registered seed. Any problem getting the
+    classifications leaves the diff as it was, so the feed never goes quiet by mistake."""
+    try:
+        item_flags = await gomode_bot.load_item_flags()
+        if not item_flags:
+            return diff
+        return gomode_bot.drop_filler(diff, item_flags, gomode_bot._load_items_received())
+    except Exception as e:
+        print(f"[tracker] filler filter failed, posting everything: {e}")
+        return diff
+
+
 # Loop function to check for changes every 60 seconds and send a DM to a specific channel.
 async def check_for_item_changes(tracker_url, auth, channel_id):
     await bot.wait_until_ready()
@@ -966,6 +979,10 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
             diff = await asyncio.get_running_loop().run_in_executor(
                 None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
             current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            if diff:
+                diff = await _hide_filler(diff)
+                if not diff:
+                    print(f"Only filler items received at {current_time}")
             if diff:
                 print(f"Changes found at {current_time}")
                 message = format_diff_message(diff)

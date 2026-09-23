@@ -78,6 +78,11 @@ Output:
 
 `--survey` analyzes every slot (empty inventory) — useful for coverage checks.
 
+`--item-flags` prints every slot's `{item name: flags}` from the seed (0b1 progression, 0b10
+useful, 0b100 trap, 0 filler, OR'd across every copy of the name). The bot runs it once per
+registered seed, caches it in `runtime/item_flags.json`, and uses it to leave filler out of the
+channel's item feed. The item-list commands still show everything.
+
 ## Bot integration (`/register_seed`)
 
 The owner-only `/register_seed` command (in `main.py`) drives the whole thing. It takes the

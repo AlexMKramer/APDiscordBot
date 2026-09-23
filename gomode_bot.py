@@ -309,6 +309,75 @@ async def analyze_slot_live(slot_name: str, inventory: dict) -> dict | None:
         _quiet_remove(tmp)
 
 
+# --- filler filtering for the item feed -------------------------------------
+# The tracker page doesn't say what kind of item something is, but the registered seed does:
+# every placed item carries flags (0b1 progression, 0b10 useful, 0b100 trap, 0 filler).
+# The analyzer extracts them once per seed; the bot caches the result next to the seed cache.
+
+ITEM_FLAGS_PATH = os.path.join(RUNTIME_DIR, "item_flags.json")
+_item_flags_memo: dict = {}   # {seed: {slot_name: {"game", "items": {name: flags}}} or None}
+
+
+async def load_item_flags() -> dict | None:
+    """Every slot's {item name: flags} for the registered seed, or None if unavailable."""
+    reg = load_registry()
+    if not reg:
+        return None
+    seed = reg.get("seed")
+    if seed in _item_flags_memo:
+        return _item_flags_memo[seed]
+    try:
+        with open(ITEM_FLAGS_PATH, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if cached.get("seed") == seed:
+            _item_flags_memo[seed] = cached["item_flags"]
+            return _item_flags_memo[seed]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+
+    cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "cli.py"), "--ap-path", reg["ap_path"],
+           "--seed-zip", reg["seed_zip"], "--item-flags"]
+    rc, out, err = await _run(cmd)
+    try:
+        result = json.loads(out) if rc == 0 else None
+    except ValueError:
+        result = None
+    if not result or result.get("seed") != seed:
+        # Remembered for this run so a broken setup doesn't spawn the analyzer every minute;
+        # registering a seed (a new seed key) tries again.
+        print(f"[item-flags] could not read item classifications: {(err or out)[-300:]}")
+        _item_flags_memo[seed] = None
+        return None
+    tmp = ITEM_FLAGS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(result, fh)
+    os.replace(tmp, ITEM_FLAGS_PATH)
+    _item_flags_memo[seed] = result["item_flags"]
+    return _item_flags_memo[seed]
+
+
+def drop_filler(diff: dict, item_flags: dict, items_received: dict) -> dict:
+    """The tracker diff ({slot: {slot_name: {"New Items": {name: count}, ...}}}) without filler.
+
+    A name is filler only if every copy of it in the seed is (Celeste 64's extra strawberries
+    are filler but the name isn't). Unknown names, and slots whose tracker game doesn't match
+    the registered seed, are left alone. A slot left with nothing to report is dropped."""
+    kept: dict = {}
+    for slot, slot_entry in diff.items():
+        for slot_name, details in slot_entry.items():
+            rec = item_flags.get(slot_name)
+            tracker_game = _tracker_game_for_slot(items_received, slot_name)
+            if rec and not (tracker_game and tracker_game.lower() != str(rec.get("game", "")).lower()):
+                flags = rec.get("items", {})
+                new_items = {name: count for name, count in details.get("New Items", {}).items()
+                             if flags.get(name) != 0}
+                details = {**details, "New Items": new_items} if new_items else \
+                    {k: v for k, v in details.items() if k != "New Items"}
+            if details.get("New Items") or "Goal Completed" in details:
+                kept.setdefault(slot, {})[slot_name] = details
+    return kept
+
+
 # --- go-mode notification dedup state (per registered seed) ------------------
 
 NOTIFIED_PATH = os.path.join(DATA_DIR, "go_mode_notified.json")
