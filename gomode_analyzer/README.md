@@ -122,6 +122,8 @@ Config (environment):
   `items_received.json`); they're matched to the seed by location ID. Like go mode, every copy
   of an item the player holds counts, so Crab Champions' duplicate perks can put a few more
   checks in logic than UT shows.
+- **`/which_checks_in_logic`** — one slot at a time: the same counts, then the names of the
+  in-logic checks not done yet, split across as many DMs as it takes.
 
 Both go-mode surfaces check against the rebuilt world's real logic, as Universal Tracker does.
 The precomputed requirement trees only feed `/items_to_go_mode`'s breakdown and the

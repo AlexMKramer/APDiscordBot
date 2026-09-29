@@ -319,11 +319,13 @@ def checked_for_slot(items_received: dict, slot_name: str) -> list:
     return []
 
 
-async def checks_in_logic(slot_names, *, items_received: dict | None = None) -> dict:
+async def checks_in_logic(slot_names, *, items_received: dict | None = None,
+                          list_names: bool = False) -> dict:
     """For each slot name, {status, game, reason?} plus, when ok, {in_logic, in_logic_done,
     total, done}: its checks reachable with what the player holds (as UT counts them) and how
-    many of those are done, and all its checks and how many are done. One batched subprocess
-    for every supported slot."""
+    many of those are done, and all its checks and how many are done. With list_names, also
+    "to_do": the names of the in-logic checks not done yet. One batched subprocess for every
+    supported slot."""
     cache, reg = load_cache(), load_registry()
     if not cache or not reg:
         return {name: {"status": "unregistered"} for name in slot_names}
@@ -347,7 +349,7 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None) -> 
             result[name] = {"status": "tracker_mismatch", "game": game}
             continue
         batch[name] = {"inventory": inventory_for_slot(items_received, name),
-                       "checked": checked_for_slot(items_received, name)}
+                       "checked": checked_for_slot(items_received, name), "list_names": list_names}
         result[name] = {"status": "error", "game": game, "reason": "no result"}
 
     if batch:

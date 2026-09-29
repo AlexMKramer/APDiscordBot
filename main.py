@@ -562,6 +562,43 @@ async def checks_in_logic(ctx, slot_names: str = None):
             content="I hit an error sending the DM — please try again.")
 
 
+@bot.slash_command(description="Get a DM listing the checks in logic for a slot that haven't been done yet.")
+@option("slot_name", description="The slot to list checks for.", autocomplete=slot_name_autocomplete, required=True)
+async def which_checks_in_logic(ctx, slot_name: str):
+    initial_response = await ctx.respond("Finding checks in logic...", ephemeral=True)
+
+    cache = gomode_bot.load_cache()
+    if gomode_bot.load_registry() is None or not cache:
+        await initial_response.edit_original_response(
+            content="No seed is registered yet. Ask the server owner to run /register_seed.")
+        return
+    name = next((s.get("name") for s in cache.get("slots", {}).values()
+                 if s.get("name", "").lower() == slot_name.strip().lower()), None)
+    if name is None:
+        await initial_response.edit_original_response(
+            content=f"**{slot_name}** isn't a slot in the registered seed.")
+        return
+
+    st = (await gomode_bot.checks_in_logic([name], list_names=True)).get(name, {})
+    message = _checks_line(name, st)
+    to_do = st.get("to_do") or []
+    if to_do:
+        message += "\n\n**In logic, not done yet:**\n" + "\n".join(f"- {check}" for check in to_do)
+    elif st.get("status") == "ok" and st.get("done", 0) < st.get("total", 0):
+        message += "\n  Nothing in logic is left to do right now."
+    try:
+        for chunk in chunk_text_by_line(message, 1900):
+            await ctx.author.send(chunk)
+        await initial_response.edit_original_response(
+            content=f"Sent you a DM with the checks in logic for **{name}**.")
+    except discord.Forbidden:
+        await initial_response.edit_original_response(
+            content="I couldn't DM you — please enable DMs from server members.")
+    except discord.HTTPException:
+        await initial_response.edit_original_response(
+            content="I hit an error sending the DM — please try again.")
+
+
 @bot.slash_command(description="Assign your discord account to a slot name. Use * as a wildcard to assign several at once.")
 @option("slot_name", description="A slot name, or a wildcard like Alex_* to assign every matching slot.", autocomplete = slot_name_autocomplete, required=True)
 async def assign_slot(ctx, slot_name: str):
