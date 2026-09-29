@@ -78,7 +78,8 @@ def main(argv=None) -> int:
                         help="Print every slot's {item name: flags} from the seed (0 = filler)")
     parser.add_argument("--checks-batch",
                         help='Checks in logic for many slots: JSON (or @path) {slot: {"inventory": {...}, '
-                             '"checked": [location names]}} -> {checks: {slot: {status, in_logic, unchecked}}}')
+                             '"checked": [location names]}} -> {checks: {slot: {status, in_logic, in_logic_done, '
+                             'total, done}}}')
     args = parser.parse_args(argv)
 
     # Do all AP work with stdout muted, build the result, then print clean JSON.
@@ -115,9 +116,8 @@ def main(argv=None) -> int:
                     # The tracker lists names from the seed's own datapackage; compare by ID.
                     name_to_id = sd.datapackage.get("location_name_to_id", {})
                     checked = {name_to_id[n] for n in request.get("checked") or [] if n in name_to_id}
-                    in_logic, unchecked = engine.checks_in_logic(
-                        prepared, request.get("inventory") or {}, checked)
-                    checks[selector] = {"status": "ok", "in_logic": in_logic, "unchecked": unchecked}
+                    counts = engine.checks_in_logic(prepared, request.get("inventory") or {}, checked)
+                    checks[selector] = {"status": "ok", **counts}
                 except Exception as exc:  # noqa: BLE001 -- one bad slot must not abort the batch
                     checks[selector] = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
             output = {"checks": checks}

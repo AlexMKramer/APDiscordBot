@@ -320,9 +320,10 @@ def checked_for_slot(items_received: dict, slot_name: str) -> list:
 
 
 async def checks_in_logic(slot_names, *, items_received: dict | None = None) -> dict:
-    """For each slot name, {status, game, in_logic?, unchecked?, reason?}: how many of its
-    unchecked locations are reachable with what the player holds, as UT counts them. One
-    batched subprocess for every supported slot."""
+    """For each slot name, {status, game, reason?} plus, when ok, {in_logic, in_logic_done,
+    total, done}: its checks reachable with what the player holds (as UT counts them) and how
+    many of those are done, and all its checks and how many are done. One batched subprocess
+    for every supported slot."""
     cache, reg = load_cache(), load_registry()
     if not cache or not reg:
         return {name: {"status": "unregistered"} for name in slot_names}

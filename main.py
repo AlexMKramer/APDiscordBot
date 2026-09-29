@@ -498,9 +498,13 @@ def _checks_line(name: str, st: dict) -> str:
         return f"• {name}{tag} — not supported for this game"
     if status != "ok":
         return f"• {name}{tag} — couldn't check right now, try again shortly"
-    if not st.get("unchecked"):
-        return f"• {name}{tag} — every check done"
-    return f"• {name}{tag} — **{st['in_logic']}** in logic ({st['unchecked']} unchecked)"
+    total, done = st.get("total", 0), st.get("done", 0)
+    if done >= total:
+        return f"• **{name}**{tag} — all {total} checks done"
+    in_logic, in_logic_done = st.get("in_logic", 0), st.get("in_logic_done", 0)
+    return (f"• **{name}**{tag}\n"
+            f"  In logic: {in_logic_done} of {in_logic} done ({in_logic - in_logic_done} left to do)\n"
+            f"  Overall: {done} of {total} checks done")
 
 
 @bot.slash_command(description="Get a DM with how many checks are in logic. Separate slots with commas; * is a wildcard.")

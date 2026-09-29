@@ -113,7 +113,8 @@ Config (environment):
   marked only after the DM actually sends. Slots are throttled on an inventory signature so an
   unchanged world isn't rebuilt every cycle.
 
-- **`/checks_in_logic`** — DMs how many of each slot's unchecked locations are in logic.
+- **`/checks_in_logic`** — DMs, per slot, how many checks are in logic and how many of those
+  are done, and how many of all its checks are done.
   Takes comma-separated slot names with wildcards (`Alex_*, Ben_PW`); blank means your
   assigned slots. Counted as UT counts them (`engine.checks_in_logic`): what the player holds,
   a sweep of their event locations, then the reachable real locations not yet checked. The
