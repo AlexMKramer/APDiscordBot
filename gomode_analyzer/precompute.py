@@ -30,6 +30,8 @@ def main(argv=None) -> int:
     sys.path.insert(0, here)
     sys.path.insert(0, os.path.abspath(args.ap_path))
     logging.disable(logging.CRITICAL)
+    import ModuleUpdate  # worlds that call it on import must not stop to ask to install packages
+    ModuleUpdate.update_ran = True
 
     only = {int(x) for x in args.slots.split(",")} if args.slots else None
 

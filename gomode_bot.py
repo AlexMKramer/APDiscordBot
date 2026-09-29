@@ -59,8 +59,10 @@ def is_configured() -> tuple[bool, str]:
 
 async def _run(cmd: list[str]) -> tuple[int, str, str]:
     """Run a subprocess to completion without blocking the event loop."""
+    # No stdin: anything in the analyzer that asks a question fails at once instead of hanging.
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
     out, err = await proc.communicate()
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
@@ -307,6 +309,65 @@ async def analyze_slot_live(slot_name: str, inventory: dict) -> dict | None:
             return {"status": "error", "reason": (err or out)[-500:]}
     finally:
         _quiet_remove(tmp)
+
+
+def checked_for_slot(items_received: dict, slot_name: str) -> list:
+    """The slot's checked location names, as the tracker page lists them."""
+    for slot_entry in (items_received or {}).values():
+        if slot_name in slot_entry:
+            return list(slot_entry[slot_name].get("Checked Locations", []) or [])
+    return []
+
+
+async def checks_in_logic(slot_names, *, items_received: dict | None = None) -> dict:
+    """For each slot name, {status, game, in_logic?, unchecked?, reason?}: how many of its
+    unchecked locations are reachable with what the player holds, as UT counts them. One
+    batched subprocess for every supported slot."""
+    cache, reg = load_cache(), load_registry()
+    if not cache or not reg:
+        return {name: {"status": "unregistered"} for name in slot_names}
+    if items_received is None:
+        items_received = _load_items_received()
+
+    result: dict = {}
+    batch: dict = {}
+    for name in slot_names:
+        rec = slot_for_name(cache, name)
+        if rec is None:
+            result[name] = {"status": "unregistered"}
+            continue
+        game = rec.get("game")
+        if rec.get("status") != "ok":
+            result[name] = {"status": rec.get("status", "error"), "game": game,
+                            "reason": rec.get("reason", "")}
+            continue
+        tracker_game = _tracker_game_for_slot(items_received, name)
+        if tracker_game and game and tracker_game.lower() != str(game).lower():
+            result[name] = {"status": "tracker_mismatch", "game": game}
+            continue
+        batch[name] = {"inventory": inventory_for_slot(items_received, name),
+                       "checked": checked_for_slot(items_received, name)}
+        result[name] = {"status": "error", "game": game, "reason": "no result"}
+
+    if batch:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(suffix=".json", dir=RUNTIME_DIR, prefix="gomode_checks_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(batch, fh)
+            cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "cli.py"), "--ap-path", reg["ap_path"],
+                   "--seed-zip", reg["seed_zip"], "--checks-batch", "@" + tmp]
+            rc, out, err = await _run(cmd)
+            try:
+                checks = json.loads(out).get("checks", {}) if rc == 0 else {}
+            except ValueError:
+                checks = {}
+        finally:
+            _quiet_remove(tmp)
+        for name, info in checks.items():
+            if name in result:
+                result[name] = {**info, "game": result[name].get("game")}
+    return result
 
 
 # --- filler filtering for the item feed -------------------------------------

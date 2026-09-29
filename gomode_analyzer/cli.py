@@ -47,6 +47,10 @@ def _bootstrap(ap_path: str) -> None:
         sys.path.insert(0, os.path.abspath(ap_path))
     # Silence AP's noisy world-loading logs so stdout stays clean JSON.
     logging.disable(logging.CRITICAL)
+    # Some worlds call ModuleUpdate on import, which asks "press enter to install" when a pin
+    # doesn't match and would wait forever. The analyzer's venv is managed by the Dockerfile.
+    import ModuleUpdate
+    ModuleUpdate.update_ran = True
 
 
 def _resolve_slot(seed, selector: str):
@@ -72,6 +76,9 @@ def main(argv=None) -> int:
                              '{slot: inventory} -> {go_mode: {slot: {status, in_go_mode}}}')
     parser.add_argument("--item-flags", action="store_true",
                         help="Print every slot's {item name: flags} from the seed (0 = filler)")
+    parser.add_argument("--checks-batch",
+                        help='Checks in logic for many slots: JSON (or @path) {slot: {"inventory": {...}, '
+                             '"checked": [location names]}} -> {checks: {slot: {status, in_logic, unchecked}}}')
     args = parser.parse_args(argv)
 
     # Do all AP work with stdout muted, build the result, then print clean JSON.
@@ -87,6 +94,33 @@ def main(argv=None) -> int:
             output = {"seed": seed.seed_name,
                       "item_flags": {sd.name: {"game": sd.game, "items": sd.item_flags}
                                      for sd in seed.slots.values()}}
+        elif args.checks_batch:
+            spec = args.checks_batch
+            if spec.startswith("@"):
+                with open(spec[1:], "r", encoding="utf-8") as fh:
+                    requested = json.load(fh)
+            else:
+                requested = json.loads(spec)
+            checks = {}
+            for selector, request in requested.items():
+                sd = _resolve_slot(seed, selector)
+                if sd is None:
+                    checks[selector] = {"status": "error", "reason": "slot not found"}
+                    continue
+                try:
+                    prepared, res = engine.prepare_slot(sd.game, sd.options, **seed.engine_kwargs(sd))
+                    if prepared is None:
+                        checks[selector] = {"status": res.status, "reason": res.reason}
+                        continue
+                    # The tracker lists names from the seed's own datapackage; compare by ID.
+                    name_to_id = sd.datapackage.get("location_name_to_id", {})
+                    checked = {name_to_id[n] for n in request.get("checked") or [] if n in name_to_id}
+                    in_logic, unchecked = engine.checks_in_logic(
+                        prepared, request.get("inventory") or {}, checked)
+                    checks[selector] = {"status": "ok", "in_logic": in_logic, "unchecked": unchecked}
+                except Exception as exc:  # noqa: BLE001 -- one bad slot must not abort the batch
+                    checks[selector] = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
+            output = {"checks": checks}
         elif args.go_mode_batch:
             spec = args.go_mode_batch
             if spec.startswith("@"):

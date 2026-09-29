@@ -113,6 +113,15 @@ Config (environment):
   marked only after the DM actually sends. Slots are throttled on an inventory signature so an
   unchanged world isn't rebuilt every cycle.
 
+- **`/checks_in_logic`** — DMs how many of each slot's unchecked locations are in logic.
+  Takes comma-separated slot names with wildcards (`Alex_*, Ben_PW`); blank means your
+  assigned slots. Counted as UT counts them (`engine.checks_in_logic`): what the player holds,
+  a sweep of their event locations, then the reachable real locations not yet checked. The
+  scraper records each slot's checked locations from its tracker page (`Checked Locations` in
+  `items_received.json`); they're matched to the seed by location ID. Like go mode, every copy
+  of an item the player holds counts, so Crab Champions' duplicate perks can put a few more
+  checks in logic than UT shows.
+
 Both go-mode surfaces check against the rebuilt world's real logic, as Universal Tracker does.
 The precomputed requirement trees only feed `/items_to_go_mode`'s breakdown and the
 registration summary.

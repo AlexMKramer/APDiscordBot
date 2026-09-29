@@ -472,6 +472,92 @@ async def items_to_go_mode(ctx, slot_name: str = None):
             content="Your status list is long, but I hit an error sending the DM — please try again.")
 
 
+async def slot_names_autocomplete(ctx: discord.AutocompleteContext):
+    """Completes the last name of a comma-separated list, keeping the ones already typed."""
+    typed, _, current = (ctx.value or "").rpartition(",")
+    prefix = f"{typed}, " if typed else ""
+    current = current.strip().lower()
+    try:
+        with open(os.path.join("data", "slot_info.json"), "r") as f:
+            slot_info = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    names = sorted(info.get("slot_name", "") for info in slot_info.values())
+    return [prefix + name for name in names if name.lower().startswith(current)][:25]
+
+
+def _checks_line(name: str, st: dict) -> str:
+    game = st.get("game") or ""
+    tag = f" ({game})" if game else ""
+    status = st.get("status")
+    if status == "unregistered":
+        return f"• {name}{tag} — not part of the registered seed"
+    if status == "tracker_mismatch":
+        return f"• {name}{tag} — tracker shows a different game; is the right seed registered?"
+    if status == "unsupported":
+        return f"• {name}{tag} — not supported for this game"
+    if status != "ok":
+        return f"• {name}{tag} — couldn't check right now, try again shortly"
+    if not st.get("unchecked"):
+        return f"• {name}{tag} — every check done"
+    return f"• {name}{tag} — **{st['in_logic']}** in logic ({st['unchecked']} unchecked)"
+
+
+@bot.slash_command(description="Get a DM with how many checks are in logic. Separate slots with commas; * is a wildcard.")
+@option("slot_names", description="Slot names or wildcards like Alex_*, comma-separated. Leave blank for your assigned slots.",
+        autocomplete=slot_names_autocomplete, required=False)
+async def checks_in_logic(ctx, slot_names: str = None):
+    initial_response = await ctx.respond("Counting checks in logic...", ephemeral=True)
+
+    cache = gomode_bot.load_cache()
+    if gomode_bot.load_registry() is None or not cache:
+        await initial_response.edit_original_response(
+            content="No seed is registered yet. Ask the server owner to run /register_seed.")
+        return
+    seed_names = [s.get("name", "") for s in cache.get("slots", {}).values()]
+
+    if not slot_names or not slot_names.strip():
+        assignments = _load_listeners().get(str(ctx.author.id), [])
+        names = [a.get("slot_name") for a in assignments if a.get("slot_name")]
+        if not names:
+            await initial_response.edit_original_response(
+                content="You have no assigned slots. Name some slots, or use /assign_slot first.")
+            return
+        unmatched = []
+    else:
+        names, unmatched = [], []
+        for pattern in (p.strip() for p in slot_names.split(",")):
+            if not pattern:
+                continue
+            if any(ch in pattern for ch in "*?["):
+                found = [n for n in seed_names if fnmatch.fnmatchcase(n.lower(), pattern.lower())]
+            else:
+                found = [n for n in seed_names if n.lower() == pattern.lower()]
+            if not found:
+                unmatched.append(pattern)
+            names += [n for n in found if n not in names]
+        if not names:
+            await initial_response.edit_original_response(
+                content=f"No slots in the registered seed match {', '.join(unmatched)}.")
+            return
+
+    status = await gomode_bot.checks_in_logic(names)
+    lines = ["**Checks in logic:**"] + [_checks_line(n, status.get(n, {})) for n in names]
+    if unmatched:
+        lines.append(f"No slots matched: {', '.join(unmatched)}")
+    try:
+        for chunk in chunk_text_by_line("\n".join(lines), 1900):
+            await ctx.author.send(chunk)
+        await initial_response.edit_original_response(
+            content=f"Sent you a DM with checks in logic for {len(names)} slot{'s' if len(names) != 1 else ''}.")
+    except discord.Forbidden:
+        await initial_response.edit_original_response(
+            content="I couldn't DM you — please enable DMs from server members.")
+    except discord.HTTPException:
+        await initial_response.edit_original_response(
+            content="I hit an error sending the DM — please try again.")
+
+
 @bot.slash_command(description="Assign your discord account to a slot name. Use * as a wildcard to assign several at once.")
 @option("slot_name", description="A slot name, or a wildcard like Alex_* to assign every matching slot.", autocomplete = slot_name_autocomplete, required=True)
 async def assign_slot(ctx, slot_name: str):

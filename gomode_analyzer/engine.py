@@ -453,6 +453,20 @@ def inventory_state(prepared: PreparedSlot, inventory: dict):
     return state, unknown
 
 
+def checks_in_logic(prepared: PreparedSlot, inventory: dict, checked: set) -> tuple[int, int]:
+    """UT's "in logic" count: collect what the player holds, sweep their event locations (only
+    events: a locked item's location is itself a check still to do), and count the reachable
+    real locations not yet checked. `checked` holds location IDs. Returns (in logic, unchecked)."""
+    multiworld = prepared.multiworld
+    state, _ = inventory_state(prepared, inventory)
+    state.sweep_for_advancements(
+        locations=[loc for loc in multiworld.get_locations(1) if loc.address is None])
+    unchecked = [loc for loc in multiworld.get_locations(1)
+                 if loc.address is not None and loc.address not in checked]
+    in_logic = sum(1 for loc in unchecked if loc.can_reach(state))
+    return in_logic, len(unchecked)
+
+
 def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[int] = None,
                  name: str = "", spoiler_settings: Optional[dict] = None,
                  precollected: Optional[list] = None, slot_data: Optional[dict] = None,

@@ -64,18 +64,35 @@ def get_tracker_urls(tracker_url, auth):
     return slot_numbers, urls, slot_names, game_names, games_statuses, checks_statuses
 
 
+def _checked_locations(soup):
+    """Names of the slot's checked locations: the locations table marks each with a ✔."""
+    table = soup.find("table", id="locations-table")
+    tbody = table.find("tbody") if table else None
+    if not tbody:
+        return []
+    checked = []
+    for row in tbody.find_all("tr"):
+        tds = row.find_all("td")
+        if len(tds) >= 2 and "✔" in tds[1].get_text():
+            checked.append(tds[0].get_text(strip=True))
+    return checked
+
+
 def track_items_from_slot(tracker_url, url, auth):
+    """(received items, checked location names) from a slot's page. Items is None when the page
+    has no received table (the game is completed)."""
     tracker_slot_url = tracker_url.split("/tracker")[0] + "/generic_tracker" + url
     page = requests.get(tracker_slot_url, auth=auth, timeout=15)
     soup = BeautifulSoup(page.content, "html.parser")
+    checked = _checked_locations(soup)
 
     items = []
     table = soup.find("table", id="received-table")
     if table is None:
-        return None
+        return None, checked
     tbody = table.find("tbody")
     if not tbody:
-        return None
+        return None, checked
     rows = tbody.find_all("tr")
 
     for row in rows:
@@ -96,7 +113,7 @@ def track_items_from_slot(tracker_url, url, auth):
 
     # Reverse the list to ensure items are ordered in the sequence they were received.
     items.reverse()
-    return items
+    return items, checked
 
 
 def get_all_tracker_received_items(tracker_url, auth):
@@ -109,7 +126,7 @@ def get_all_tracker_received_items(tracker_url, auth):
         game_name = game_names[idx]
         game_status = games_statuses[idx]
         checks_status = checks_statuses[idx]
-        items = track_items_from_slot(tracker_url, url, auth)
+        items, checked = track_items_from_slot(tracker_url, url, auth)
         if items is not None:
             # Create a dictionary with numbered items (starting at 1)
             item_dict = {str(i + 1): item for i, item in enumerate(items)}
@@ -121,7 +138,8 @@ def get_all_tracker_received_items(tracker_url, auth):
                 "Game Name": game_name,
                 "Game Status": game_status,
                 "Checks Status": checks_status,
-                "Items": item_dict
+                "Items": item_dict,
+                "Checked Locations": checked,
             }
         }
 
