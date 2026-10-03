@@ -180,6 +180,7 @@ class PreparedSlot:
     universe: list          # every progression Item the player can ever hold (pool + start items)
     prog_names: set         # names that are progression somewhere in the universe
     templates: dict         # item name -> an Item the rebuild made, for worlds without create_item
+    made: dict = field(default_factory=dict)  # item name -> the Item inventory_state copies from
 
 
 def _make_item(world, name: str, templates: dict):
@@ -422,6 +423,7 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
 def inventory_state(prepared: PreparedSlot, inventory: dict):
     """A CollectionState holding the player's inventory ({item_name: count}), built the way UT
     builds it. Returns (state, unknown_item_names)."""
+    import copy
     from BaseClasses import CollectionState, ItemClassification
 
     world = prepared.multiworld.worlds[1]
@@ -437,18 +439,25 @@ def inventory_state(prepared: PreparedSlot, inventory: dict):
         if item_name not in prepared.world_type.item_name_to_id:
             unknown.append(item_name)
             continue
-        for _ in range(count):
+        template = prepared.made.get(item_name)
+        if template is None:
             try:
-                item = _make_item(world, item_name, prepared.templates)
+                template = _make_item(world, item_name, prepared.templates)
             except Exception:  # noqa: BLE001 -- can't make it at all: report it, don't guess
                 unknown.append(item_name)
-                break
+                continue
             # UT ORs in the server's item flags. The tracker page doesn't carry them per copy,
             # so any copy of a name that's progression for this slot counts: in the game, every
             # copy you hold works (e.g. any 16 strawberries finish Celeste 64, even though the
             # generator only flagged 16 specific copies as progression).
-            if not item.advancement and item_name in prepared.prog_names:
-                item.classification |= ItemClassification.progression
+            if not template.advancement and item_name in prepared.prog_names:
+                template.classification |= ItemClassification.progression
+            # Made once and copied from then on: some worlds' create_item counts its calls
+            # (Celeste 64 hands out progression strawberries until it has made enough).
+            prepared.made[item_name] = template
+        for _ in range(count):
+            item = copy.copy(template)
+            item.location = None
             state.collect(item, prevent_sweep=True)
     return state, unknown
 
@@ -477,6 +486,38 @@ def checks_in_logic(prepared: PreparedSlot, inventory: dict, checked: set, *,
     if list_names:
         counts["to_do"] = sorted(loc.name for loc in reachable if loc.address not in checked)
     return counts
+
+
+def most_useful_items(prepared: PreparedSlot, inventory: dict, checked: set, top: int = 5) -> list:
+    """The missing progression items that would each open the most new checks on their own:
+    [{"name", "opens"}], best first, only items that open at least one. For every name the
+    player could still get another copy of, add one copy and count the in-logic checks not yet
+    done. Spoiler-safe: item names only."""
+    multiworld = prepared.multiworld
+    events = [loc for loc in multiworld.get_locations(1) if loc.address is None]
+    unchecked = [loc for loc in multiworld.get_locations(1)
+                 if loc.address is not None and loc.address not in checked]
+
+    def to_do(extra=None):
+        inv = dict(inventory)
+        if extra:
+            inv[extra] = int(inv.get(extra, 0) or 0) + 1
+        state, _ = inventory_state(prepared, inv)
+        state.sweep_for_advancements(locations=events)
+        return sum(1 for loc in unchecked if loc.can_reach(state))
+
+    base = to_do()
+    held = Counter({name: int(count or 0) for name, count in inventory.items()})
+    obtainable = Counter(item.name for item in prepared.universe)
+    gains = []
+    for name in sorted(obtainable):
+        if held[name] >= obtainable[name]:
+            continue
+        opens = to_do(name) - base
+        if opens > 0:
+            gains.append({"name": name, "opens": opens})
+    gains.sort(key=lambda g: (-g["opens"], g["name"]))
+    return gains[:top]
 
 
 def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[int] = None,
@@ -508,7 +549,13 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
                                     expected_prog=expected_prog, result=result)
     if prepared is None:
         return result
+    return analyze_prepared(prepared, result, inventory, fast=fast)
 
+
+def analyze_prepared(prepared: PreparedSlot, result: SlotResult, inventory: dict, *,
+                     fast: bool = False) -> SlotResult:
+    """analyze_slot's analysis for a slot that's already built. `result` is the SlotResult
+    prepare_slot returned; it's filled in and returned."""
     multiworld = prepared.multiworld
     current, result.unknown_inventory = inventory_state(prepared, inventory)
 

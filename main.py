@@ -80,6 +80,12 @@ async def on_connect():
     print("Starting go-mode notification loop.")
     bot.loop.create_task(check_go_mode_loop())
 
+    print("Starting unstuck alert loop.")
+    bot.loop.create_task(check_unstuck_loop())
+
+    # Build every slot of the registered seed now, so the first command doesn't wait on it.
+    bot.loop.create_task(gomode_bot.warm_worker())
+
 
 @bot.event
 async def on_disconnect():
@@ -486,6 +492,32 @@ async def slot_names_autocomplete(ctx: discord.AutocompleteContext):
     return [prefix + name for name in names if name.lower().startswith(current)][:25]
 
 
+def _resolve_slot_names(slot_names, cache: dict, author_id: str):
+    """Comma-separated slot names or wildcards -> (names, unmatched patterns, problem message).
+    Blank means the caller's assigned slots. `problem` is set when nothing usable matched."""
+    seed_names = [s.get("name", "") for s in cache.get("slots", {}).values()]
+    if not slot_names or not slot_names.strip():
+        assignments = _load_listeners().get(author_id, [])
+        names = [a.get("slot_name") for a in assignments if a.get("slot_name")]
+        if not names:
+            return [], [], "You have no assigned slots. Name some slots, or use /assign_slot first."
+        return names, [], None
+    names, unmatched = [], []
+    for pattern in (p.strip() for p in slot_names.split(",")):
+        if not pattern:
+            continue
+        if any(ch in pattern for ch in "*?["):
+            found = [n for n in seed_names if fnmatch.fnmatchcase(n.lower(), pattern.lower())]
+        else:
+            found = [n for n in seed_names if n.lower() == pattern.lower()]
+        if not found:
+            unmatched.append(pattern)
+        names += [n for n in found if n not in names]
+    if not names:
+        return [], unmatched, f"No slots in the registered seed match {', '.join(unmatched)}."
+    return names, unmatched, None
+
+
 def _checks_line(name: str, st: dict) -> str:
     game = st.get("game") or ""
     tag = f" ({game})" if game else ""
@@ -518,32 +550,10 @@ async def checks_in_logic(ctx, slot_names: str = None):
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
         return
-    seed_names = [s.get("name", "") for s in cache.get("slots", {}).values()]
-
-    if not slot_names or not slot_names.strip():
-        assignments = _load_listeners().get(str(ctx.author.id), [])
-        names = [a.get("slot_name") for a in assignments if a.get("slot_name")]
-        if not names:
-            await initial_response.edit_original_response(
-                content="You have no assigned slots. Name some slots, or use /assign_slot first.")
-            return
-        unmatched = []
-    else:
-        names, unmatched = [], []
-        for pattern in (p.strip() for p in slot_names.split(",")):
-            if not pattern:
-                continue
-            if any(ch in pattern for ch in "*?["):
-                found = [n for n in seed_names if fnmatch.fnmatchcase(n.lower(), pattern.lower())]
-            else:
-                found = [n for n in seed_names if n.lower() == pattern.lower()]
-            if not found:
-                unmatched.append(pattern)
-            names += [n for n in found if n not in names]
-        if not names:
-            await initial_response.edit_original_response(
-                content=f"No slots in the registered seed match {', '.join(unmatched)}.")
-            return
+    names, unmatched, problem = _resolve_slot_names(slot_names, cache, str(ctx.author.id))
+    if problem:
+        await initial_response.edit_original_response(content=problem)
+        return
 
     status = await gomode_bot.checks_in_logic(names)
     lines = ["**Checks in logic:**"] + [_checks_line(n, status.get(n, {})) for n in names]
@@ -597,6 +607,89 @@ async def which_checks_in_logic(ctx, slot_name: str):
     except discord.HTTPException:
         await initial_response.edit_original_response(
             content="I hit an error sending the DM — please try again.")
+
+
+@bot.slash_command(description="Get a DM ranking the missing items that would open the most checks for a slot.")
+@option("slot_name", description="The slot to rank items for.", autocomplete=slot_name_autocomplete, required=True)
+async def most_useful_items(ctx, slot_name: str):
+    initial_response = await ctx.respond("Ranking items...", ephemeral=True)
+
+    cache = gomode_bot.load_cache()
+    if gomode_bot.load_registry() is None or not cache:
+        await initial_response.edit_original_response(
+            content="No seed is registered yet. Ask the server owner to run /register_seed.")
+        return
+    name = next((s.get("name") for s in cache.get("slots", {}).values()
+                 if s.get("name", "").lower() == slot_name.strip().lower()), None)
+    if name is None:
+        await initial_response.edit_original_response(
+            content=f"**{slot_name}** isn't a slot in the registered seed.")
+        return
+
+    st = await gomode_bot.most_useful_items(name, top=10)
+    game = st.get("game") or ""
+    tag = f" ({game})" if game else ""
+    if st.get("status") != "ok":
+        message = _checks_line(name, st)
+    elif not st.get("items"):
+        message = f"**{name}**{tag}: no single missing item opens new checks right now."
+    else:
+        lines = [f"**Most useful items for {name}**{tag}:"]
+        for rank, item in enumerate(st["items"], 1):
+            lines.append(f"{rank}. {item['name']} — opens {item['opens']} check{'s' if item['opens'] != 1 else ''}")
+        message = "\n".join(lines)
+    try:
+        for chunk in chunk_text_by_line(message, 1900):
+            await ctx.author.send(chunk)
+        await initial_response.edit_original_response(
+            content=f"Sent you a DM with the most useful items for **{name}**.")
+    except discord.Forbidden:
+        await initial_response.edit_original_response(
+            content="I couldn't DM you — please enable DMs from server members.")
+    except discord.HTTPException:
+        await initial_response.edit_original_response(
+            content="I hit an error sending the DM — please try again.")
+
+
+@bot.slash_command(description="Get a DM when a slot that's out of checks in logic gets some again.")
+@option("action", description="Turn alerts on or off for some slots, or list yours.",
+        choices=["on", "off", "list"], required=True)
+@option("slot_names", description="Slot names or wildcards like Alex_*, comma-separated. Leave blank for your assigned slots.",
+        autocomplete=slot_names_autocomplete, required=False)
+async def unstuck_alerts(ctx, action: str, slot_names: str = None):
+    initial_response = await ctx.respond("Updating your unstuck alerts...", ephemeral=True)
+    author_id = str(ctx.author.id)
+    subs = gomode_bot.load_unstuck_subscriptions()
+    mine = set(subs.get(author_id, []))
+
+    if action == "list":
+        content = (f"You'll get unstuck alerts for: {', '.join(sorted(mine))}" if mine
+                   else "You haven't signed up for any unstuck alerts.")
+        await initial_response.edit_original_response(content=content[:1900])
+        return
+
+    cache = gomode_bot.load_cache()
+    if gomode_bot.load_registry() is None or not cache:
+        await initial_response.edit_original_response(
+            content="No seed is registered yet. Ask the server owner to run /register_seed.")
+        return
+    names, unmatched, problem = _resolve_slot_names(slot_names, cache, author_id)
+    if problem:
+        await initial_response.edit_original_response(content=problem)
+        return
+
+    if action == "on":
+        mine |= set(names)
+        content = (f"Unstuck alerts on for {', '.join(names)}. I'll DM you when one of them goes "
+                   f"from no checks in logic to having some.")
+    else:
+        mine -= set(names)
+        content = f"Unstuck alerts off for {', '.join(names)}."
+    if unmatched:
+        content += f"\nNo slots matched: {', '.join(unmatched)}"
+    subs[author_id] = sorted(mine)
+    gomode_bot.save_unstuck_subscriptions(subs)
+    await initial_response.edit_original_response(content=content[:1900])
 
 
 @bot.slash_command(description="Assign your discord account to a slot name. Use * as a wildcard to assign several at once.")
@@ -1462,6 +1555,78 @@ async def _run_tracked_items_check():
     if any_update:
         with open(listeners_data_json, "w") as f:
             json.dump(listeners_data, f, indent=4)
+
+
+async def check_unstuck_loop():
+    """Opt-in alerts: DM a player when a slot they signed up for goes from nothing left to do in
+    logic to having checks again. Players sign up with /unstuck_alerts."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await _run_unstuck_alerts()
+        except Exception as e:  # never let one bad cycle kill the loop
+            print(f"[unstuck] alert check error: {e}")
+        await asyncio.sleep(120)
+
+
+async def _run_unstuck_alerts():
+    reg = gomode_bot.load_registry()
+    if not reg:
+        return
+    seed = reg.get("seed")
+    slot_to_users = {}
+    for user_id, names in gomode_bot.load_unstuck_subscriptions().items():
+        for name in names:
+            slot_to_users.setdefault(name, set()).add(user_id)
+    if not slot_to_users:
+        return
+
+    items_received = gomode_bot._load_items_received()
+    status = await gomode_bot.checks_in_logic(list(slot_to_users), items_received=items_received)
+    state = gomode_bot.load_unstuck_state(seed)
+    item_flags = await gomode_bot.load_item_flags() or {}
+    changed = False
+    for name, user_ids in slot_to_users.items():
+        st = status.get(name, {})
+        if st.get("status") != "ok":
+            continue
+        to_do = st.get("in_logic", 0) - st.get("in_logic_done", 0)
+        inventory = gomode_bot.inventory_for_slot(items_received, name)
+        previous = state.get(name)
+        if previous != {"to_do": to_do, "inventory": inventory}:
+            state[name] = {"to_do": to_do, "inventory": inventory}
+            changed = True
+        # The first look at a slot is only remembered, so signing up never sends a stale alert.
+        if previous is None or previous.get("to_do") != 0 or to_do == 0:
+            continue
+        if st.get("done", 0) >= st.get("total", 0):
+            continue
+
+        before = previous.get("inventory", {})
+        flags = (item_flags.get(name) or {}).get("items", {})
+        new_items = [f"{item}" + (f" x{count - before.get(item, 0)}" if count - before.get(item, 0) > 1 else "")
+                     for item, count in inventory.items()
+                     if count > before.get(item, 0) and flags.get(item) != 0]
+        game = st.get("game") or ""
+        msg = (f"🔓 **{name}**" + (f" ({game})" if game else "") +
+               f" has **{to_do}** check{'s' if to_do != 1 else ''} in logic again.")
+        if new_items:
+            msg += "\nNew since then: " + ", ".join(new_items[:15])
+        for user_id in user_ids:
+            try:
+                user = await bot.fetch_user(int(user_id))
+                if user:
+                    await user.send(msg)
+            except discord.Forbidden:
+                print(f"[unstuck] could not DM {user_id} for {name} (DMs disabled)")
+            except Exception as e:
+                print(f"[unstuck] DM error for {user_id}/{name}: {e}")
+
+    if changed:
+        try:
+            gomode_bot.save_unstuck_state(seed, state)
+        except Exception as e:
+            print(f"[unstuck] could not save state: {e}")
 
 
 async def check_go_mode_loop():

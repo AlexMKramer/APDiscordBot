@@ -6,7 +6,9 @@ apworld is code execution). This module just:
 
   * provisions a version-pinned AP env for a registered seed (`gomode_analyzer/provision.py`),
   * precomputes every slot's go-mode requirements once (`gomode_analyzer/precompute.py`),
-  * manages the small JSON registry the player-facing commands + notification loop read.
+  * keeps one analyzer running for the registered seed (`gomode_analyzer/worker.py`) and sends
+    it the go-mode, checks and item-ranking queries,
+  * manages the small JSON registry and state files the commands and loops read.
 
 Large, static apworlds are NOT uploaded through Discord -- the host places them on the bot
 server (e.g. via FTP) in GOMODE_APWORLDS_DIR. Only the small per-seed generation zip comes
@@ -19,7 +21,6 @@ import datetime
 import json
 import os
 import sys
-import tempfile
 
 ANALYZER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gomode_analyzer")
 
@@ -219,32 +220,109 @@ def _tracker_game_for_slot(items_received: dict, slot_name: str):
     return None
 
 
-async def _oracle_go_mode(ap_path: str, seed_zip: str, slot_inv_map: dict) -> dict:
-    """One fast-path subprocess returning {slot: {status, in_go_mode}} for several slots at once."""
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(suffix=".json", dir=RUNTIME_DIR, prefix="gomode_batch_")
+# --- persistent analyzer -----------------------------------------------------
+# One long-running analyzer (gomode_analyzer/worker.py) holds every slot's rebuilt world, so a
+# go-mode or checks query takes milliseconds instead of a new subprocess rebuilding worlds.
+
+WORKER_LOG = os.path.join(RUNTIME_DIR, "worker.log")
+WORKER_READY_TIMEOUT = 900     # building every slot of a large seed
+WORKER_REQUEST_TIMEOUT = 600   # a full requirement analysis can take a while
+
+
+class WorkerError(RuntimeError):
+    """The analyzer answered, but the request itself failed."""
+
+
+class _Worker:
+    def __init__(self):
+        self.proc = None
+        self.key = None      # (seed, ap_path, seed_zip) the running worker was started for
+        self.log = None
+        self.lock = asyncio.Lock()
+        self.next_id = 0
+
+    async def _stop(self):
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+            try:
+                await self.proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+        self.proc, self.key = None, None
+        if self.log:
+            self.log.close()
+            self.log = None
+
+    async def _start(self, reg: dict):
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        # stderr to a file: Archipelago's chatter would otherwise fill the pipe and stall it.
+        self.log = open(WORKER_LOG, "a", encoding="utf-8")
+        self.proc = await asyncio.create_subprocess_exec(
+            AP_PYTHON, os.path.join(ANALYZER_DIR, "worker.py"),
+            "--ap-path", reg["ap_path"], "--seed-zip", reg["seed_zip"],
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=self.log,
+            limit=64 * 1024 * 1024)
+        line = await asyncio.wait_for(self.proc.stdout.readline(), WORKER_READY_TIMEOUT)
+        ready = json.loads(line) if line else {}
+        if not ready.get("ready"):
+            await self._stop()
+            raise RuntimeError(f"analyzer worker didn't start; see {WORKER_LOG}")
+        self.key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"))
+        print(f"[worker] ready: seed {ready.get('seed')}, {ready.get('built')}/{ready.get('slots')} "
+              f"slots built in {ready.get('seconds')}s")
+
+    async def request(self, op: str, **payload):
+        reg = load_registry()
+        if not reg:
+            raise RuntimeError("no seed registered")
+        key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"))
+        async with self.lock:
+            for attempt in (1, 2):
+                try:
+                    # (Re)start for a new registration, or after the worker died.
+                    if self.proc is None or self.proc.returncode is not None or self.key != key:
+                        await self._stop()
+                        await self._start(reg)
+                    self.next_id += 1
+                    message = {"id": self.next_id, "op": op, **payload}
+                    self.proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+                    await self.proc.stdin.drain()
+                    line = await asyncio.wait_for(self.proc.stdout.readline(), WORKER_REQUEST_TIMEOUT)
+                    if not line:
+                        raise RuntimeError("analyzer worker exited")
+                    reply = json.loads(line)
+                    if reply.get("id") != message["id"]:
+                        raise RuntimeError("analyzer worker replied out of order")
+                except (RuntimeError, OSError, ValueError, asyncio.TimeoutError) as exc:
+                    # Dead, hung or confused: start a fresh one and try once more.
+                    await self._stop()
+                    if attempt == 2:
+                        raise RuntimeError(f"analyzer worker failed: {exc}") from exc
+                    continue
+                if not reply.get("ok"):
+                    raise WorkerError(reply.get("error") or "request failed")
+                return reply["result"]
+
+
+_worker = _Worker()
+
+
+async def warm_worker() -> None:
+    """Start the analyzer for the registered seed ahead of the first query (bot startup)."""
+    if load_registry() is None:
+        return
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(slot_inv_map, fh)
-        cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "cli.py"),
-               "--ap-path", ap_path, "--seed-zip", seed_zip, "--go-mode-batch", "@" + tmp]
-        rc, out, err = await _run(cmd)
-        if rc != 0:
-            return {}
-        try:
-            return json.loads(out).get("go_mode", {})
-        except ValueError:
-            return {}
-    finally:
-        _quiet_remove(tmp)
+        await _worker.request("ping")
+    except Exception as e:  # noqa: BLE001 -- a later query will retry
+        print(f"[worker] couldn't start: {e}")
 
 
 async def go_mode_status(slot_names, *, items_received: dict | None = None) -> dict:
     """For each assigned slot name, return {status, in_go_mode, game, reason?}.
 
     Every supported slot is checked the way Universal Tracker does it: against its rebuilt
-    world's real logic, in one batched subprocess. Unsupported/unregistered slots are reported
-    as such (in_go_mode = None).
+    world's real logic, in one request to the analyzer. Unsupported/unregistered slots are
+    reported as such (in_go_mode = None).
     """
     cache, reg = load_cache(), load_registry()
     if not cache or not reg:
@@ -277,7 +355,11 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
         result[name] = {"status": "ok", "in_go_mode": None, "game": game}
 
     if batch:
-        oracle = await _oracle_go_mode(reg["ap_path"], reg["seed_zip"], batch)
+        try:
+            oracle = await _worker.request("go_mode", slots=batch)
+        except Exception as e:  # noqa: BLE001 -- leave in_go_mode None; the next cycle retries
+            print(f"[go-mode] analyzer request failed: {e}")
+            oracle = {}
         for name, info in oracle.items():
             if name in result:
                 result[name]["in_go_mode"] = info.get("in_go_mode")
@@ -288,27 +370,14 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
 
 
 async def analyze_slot_live(slot_name: str, inventory: dict) -> dict | None:
-    """Full on-demand analysis of one slot for the player's current inventory (a subprocess in
-    the AP env). Returns cli.py's result dict (incl. `requirements_text`), or None if no seed
-    is registered."""
-    reg = load_registry()
-    if not reg:
+    """Full on-demand analysis of one slot for the player's current inventory. Returns the
+    analysis dict (incl. `requirements_text`), or None if no seed is registered."""
+    if load_registry() is None:
         return None
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(suffix=".json", dir=RUNTIME_DIR, prefix="gomode_inv_")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(inventory, fh)
-        cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "cli.py"),
-               "--ap-path", reg["ap_path"], "--seed-zip", reg["seed_zip"],
-               "--slot", slot_name, "--inventory", "@" + tmp]
-        rc, out, err = await _run(cmd)
-        try:
-            return json.loads(out)
-        except ValueError:
-            return {"status": "error", "reason": (err or out)[-500:]}
-    finally:
-        _quiet_remove(tmp)
+        return await _worker.request("analyze", slot=slot_name, inventory=inventory)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "reason": str(e)[-500:]}
 
 
 def checked_for_slot(items_received: dict, slot_name: str) -> list:
@@ -324,7 +393,7 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None,
     """For each slot name, {status, game, reason?} plus, when ok, {in_logic, in_logic_done,
     total, done}: its checks reachable with what the player holds (as UT counts them) and how
     many of those are done, and all its checks and how many are done. With list_names, also
-    "to_do": the names of the in-logic checks not done yet. One batched subprocess for every
+    "to_do": the names of the in-logic checks not done yet. One analyzer request for every
     supported slot."""
     cache, reg = load_cache(), load_registry()
     if not cache or not reg:
@@ -353,32 +422,49 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None,
         result[name] = {"status": "error", "game": game, "reason": "no result"}
 
     if batch:
-        os.makedirs(RUNTIME_DIR, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(suffix=".json", dir=RUNTIME_DIR, prefix="gomode_checks_")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(batch, fh)
-            cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "cli.py"), "--ap-path", reg["ap_path"],
-                   "--seed-zip", reg["seed_zip"], "--checks-batch", "@" + tmp]
-            rc, out, err = await _run(cmd)
-            try:
-                checks = json.loads(out).get("checks", {}) if rc == 0 else {}
-            except ValueError:
-                checks = {}
-        finally:
-            _quiet_remove(tmp)
+            checks = await _worker.request("checks", slots=batch)
+        except Exception as e:  # noqa: BLE001 -- slots stay "couldn't check right now"
+            print(f"[checks] analyzer request failed: {e}")
+            checks = {}
         for name, info in checks.items():
             if name in result:
                 result[name] = {**info, "game": result[name].get("game")}
     return result
 
 
+async def most_useful_items(slot_name: str, *, items_received: dict | None = None,
+                            top: int = 5) -> dict:
+    """{status, game, items?: [{"name", "opens"}], reason?}: the missing items that would each
+    open the most new checks for the slot right now."""
+    cache = load_cache()
+    if not cache or load_registry() is None:
+        return {"status": "unregistered"}
+    rec = slot_for_name(cache, slot_name)
+    if rec is None:
+        return {"status": "unregistered"}
+    game = rec.get("game")
+    if rec.get("status") != "ok":
+        return {"status": rec.get("status", "error"), "game": game, "reason": rec.get("reason", "")}
+    if items_received is None:
+        items_received = _load_items_received()
+    tracker_game = _tracker_game_for_slot(items_received, slot_name)
+    if tracker_game and game and tracker_game.lower() != str(game).lower():
+        return {"status": "tracker_mismatch", "game": game}
+    try:
+        reply = await _worker.request("useful_items", slot=rec.get("name", slot_name), top=top,
+                                      inventory=inventory_for_slot(items_received, slot_name),
+                                      checked=checked_for_slot(items_received, slot_name))
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "game": game, "reason": str(e)[-300:]}
+    return {**reply, "game": game}
+
+
 # --- filler filtering for the item feed -------------------------------------
 # The tracker page doesn't say what kind of item something is, but the registered seed does:
 # every placed item carries flags (0b1 progression, 0b10 useful, 0b100 trap, 0 filler).
-# The analyzer extracts them once per seed; the bot caches the result next to the seed cache.
+# The analyzer reads them from the seed; the bot keeps them for the life of the registration.
 
-ITEM_FLAGS_PATH = os.path.join(RUNTIME_DIR, "item_flags.json")
 _item_flags_memo: dict = {}   # {seed: {slot_name: {"game", "items": {name: flags}}} or None}
 
 
@@ -391,31 +477,15 @@ async def load_item_flags() -> dict | None:
     if seed in _item_flags_memo:
         return _item_flags_memo[seed]
     try:
-        with open(ITEM_FLAGS_PATH, encoding="utf-8") as fh:
-            cached = json.load(fh)
-        if cached.get("seed") == seed:
-            _item_flags_memo[seed] = cached["item_flags"]
-            return _item_flags_memo[seed]
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        pass
-
-    cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "cli.py"), "--ap-path", reg["ap_path"],
-           "--seed-zip", reg["seed_zip"], "--item-flags"]
-    rc, out, err = await _run(cmd)
-    try:
-        result = json.loads(out) if rc == 0 else None
-    except ValueError:
+        result = await _worker.request("item_flags")
+    except Exception as e:  # noqa: BLE001
         result = None
+        print(f"[item-flags] could not read item classifications: {e}")
     if not result or result.get("seed") != seed:
-        # Remembered for this run so a broken setup doesn't spawn the analyzer every minute;
-        # registering a seed (a new seed key) tries again.
-        print(f"[item-flags] could not read item classifications: {(err or out)[-300:]}")
+        # Remembered for this run so a broken setup doesn't retry every minute; registering a
+        # seed (a new seed key) tries again.
         _item_flags_memo[seed] = None
         return None
-    tmp = ITEM_FLAGS_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(result, fh)
-    os.replace(tmp, ITEM_FLAGS_PATH)
     _item_flags_memo[seed] = result["item_flags"]
     return _item_flags_memo[seed]
 
@@ -465,3 +535,45 @@ def save_notified(current_seed: str, notified) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"seed": current_seed, "notified": sorted(notified)}, fh, indent=2)
     os.replace(tmp, NOTIFIED_PATH)
+
+
+# --- unstuck alerts (opt-in, per player and slot) ----------------------------
+
+UNSTUCK_SUBS_PATH = os.path.join(DATA_DIR, "unstuck_alerts.json")
+UNSTUCK_STATE_PATH = os.path.join(DATA_DIR, "unstuck_state.json")
+
+
+def _write_json(path: str, data) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def load_unstuck_subscriptions() -> dict:
+    """{discord user id: [slot names]} of players who signed up for unstuck alerts."""
+    try:
+        with open(UNSTUCK_SUBS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_unstuck_subscriptions(subs: dict) -> None:
+    _write_json(UNSTUCK_SUBS_PATH, {user: sorted(set(names)) for user, names in subs.items() if names})
+
+
+def load_unstuck_state(current_seed: str) -> dict:
+    """{slot name: {"to_do": int, "inventory": {...}}} last seen for the CURRENT seed."""
+    try:
+        with open(UNSTUCK_STATE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return data.get("slots", {}) if data.get("seed") == current_seed else {}
+
+
+def save_unstuck_state(current_seed: str, slots: dict) -> None:
+    _write_json(UNSTUCK_STATE_PATH, {"seed": current_seed, "slots": slots})

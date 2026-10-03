@@ -26,7 +26,8 @@ run). So it cannot leak routing spoilers like "complete location Y to get player
 | `seed_data.py` | AP env | Decode a generated `AP_<seed>.zip` → per-slot `{game, slot_data, resolved options, precollected, spoiler settings, datapackage, real location IDs, real progression items}` + version + the generation seed (from the spoiler header). |
 | `spoiler_options.py` | mixed | Parse the spoiler's per-player blocks (pure text) and reverse the options back into `{attr: value}` (AP env). Recovers settings for worlds that put nothing in slot_data. |
 | `engine.py` | AP env | Rebuild a slot's world (no fill) the way Universal Tracker does, plus a replay of the slot's real RNG; compute go-mode + the minimal still-needed item set, with guardrails. |
-| `cli.py` | AP env | JSON entrypoint the bot calls for an on-demand single-slot analysis. Emits clean JSON only. |
+| `worker.py` | AP env | The analyzer the bot keeps running: builds every slot of the registered seed once, then answers go-mode, checks, analysis and item-ranking requests from memory (one JSON line in, one out). |
+| `cli.py` | AP env | Command-line JSON entrypoint for one-off analyses and debugging. Emits clean JSON only. |
 | `precompute.py` | AP env | Analyze **every** slot once (empty inventory) and write `runtime/seed_cache.json` — the per-slot requirement trees the bot reads. Run once per registered seed. |
 | `../gomode_bot.py` | bot env | Orchestrates `provision.py` + `precompute.py` as subprocesses for `/register_seed`, and exposes the cached registry (`load_registry`/`load_cache`) to the bot. Imports neither Discord nor AP. |
 
@@ -124,14 +125,23 @@ Config (environment):
   checks in logic than UT shows.
 - **`/which_checks_in_logic`** — one slot at a time: the same counts, then the names of the
   in-logic checks not done yet, split across as many DMs as it takes.
+- **`/most_useful_items`** — one slot: the missing items that would each open the most new
+  checks on their own (`engine.most_useful_items`), best first. Item names only.
+- **`/unstuck_alerts`** — opt-in: a player turns alerts on or off for some slots (or lists
+  theirs). Every 120s the bot checks those slots and DMs the subscribers when one goes from no
+  checks left in logic to having some, naming the new non-filler items. Subscriptions are in
+  `data/unstuck_alerts.json`, last-seen state per seed in `data/unstuck_state.json`.
 
 Both go-mode surfaces check against the rebuilt world's real logic, as Universal Tracker does.
 The precomputed requirement trees only feed `/items_to_go_mode`'s breakdown and the
 registration summary.
 
-`cli.py --go-mode-batch @file` is that boolean check: input `{slot: inventory}`, output
-`{go_mode: {slot: {status, in_go_mode}}}`, via `analyze_slot(fast=True)` (same build +
-guardrails, skips the requirement decomposition).
+All of these go through `worker.py`, which `gomode_bot` starts for the registered seed (at bot
+startup, and again after a new registration or if it dies). It builds every slot once (about
+20 s for 102 slots), after which a go-mode check of every slot takes about 0.1 s, against about
+30 s when each request started a fresh subprocess. Its stderr goes to `runtime/worker.log`.
+The go-mode check is `analyze_prepared(fast=True)`: the same build and guardrails, skipping the
+requirement decomposition.
 
 **Operational requirement:** register the *same* seed the tracker is tracking. The bot joins
 live inventory to the registered slot purely by slot name; a cheap game-name cross-check
