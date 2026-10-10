@@ -183,7 +183,7 @@ def _load_items_received() -> dict:
     try:
         with open(os.path.join(DATA_DIR, "items_received.json"), encoding="utf-8") as fh:
             return json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -412,6 +412,11 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None,
         if rec.get("status") != "ok":
             result[name] = {"status": rec.get("status", "error"), "game": game,
                             "reason": rec.get("reason", "")}
+            continue
+        if not any(name in entry for entry in items_received.values()):
+            # No tracker data for the slot (e.g. the file was unreadable): counting it as
+            # holding nothing and having checked nothing would give wrong numbers.
+            result[name] = {"status": "error", "game": game, "reason": "no tracker data"}
             continue
         tracker_game = _tracker_game_for_slot(items_received, name)
         if tracker_game and game and tracker_game.lower() != str(game).lower():

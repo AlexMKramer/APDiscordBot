@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 from bs4 import BeautifulSoup
 import requests
@@ -383,9 +384,18 @@ def get_all_tracker_received_items(tracker_url, auth):
             if diff_entry:
                 diff.setdefault(slot, {})[slot_name_key] = diff_entry
 
-    # Write the new results to the JSON file.
-    with open(items_received_json, "w") as outfile:
+    # Write to a temp file and swap it in: other loops read this file while it's being written,
+    # and a half-written file reads as empty (no items, nothing checked).
+    with open(items_received_json + ".tmp", "w") as outfile:
         json.dump(result, outfile, indent=4)
+    for attempt in range(10):
+        try:
+            os.replace(items_received_json + ".tmp", items_received_json)
+            break
+        except PermissionError:  # Windows: a reader has the file open for a moment
+            if attempt == 9:
+                raise
+            time.sleep(0.1)
 
     return diff
 
