@@ -224,7 +224,8 @@ def unfound_hints(api_hints, slot_names, item_names_by_player, location_names_by
 
     Each hint is listed under both its receiver and its finder (and group members), so they are
     de-duplicated. A hint is a Hint tuple [receiving_player, finding_player, location, item,
-    found, entrance, item_flags, status] or, on a different WebHost, a dict with those keys."""
+    found, entrance, item_flags, status] or, on a different WebHost, a dict with those keys.
+    Filler hints (item_flags 0) are left out."""
     fields = ("receiving_player", "finding_player", "location", "item", "found", "entrance")
     seen = {}
     for entry in api_hints or []:
@@ -232,10 +233,16 @@ def unfound_hints(api_hints, slot_names, item_names_by_player, location_names_by
         for hint in entry.get("hints", []):
             if isinstance(hint, dict):
                 receiver, finder, location, item, found, entrance = (hint.get(f) for f in fields)
+                flags = hint.get("item_flags")
             else:
                 receiver, finder, location, item, found = hint[:5]
                 entrance = hint[5] if len(hint) > 5 else ""
+                flags = hint[6] if len(hint) > 6 else None
             if found:
+                continue
+            # Same rule as the item feed: flags 0 is filler (traps, useful and progression stay).
+            # A hint with no flags is kept.
+            if flags == 0:
                 continue
             key = (team, receiver, finder, location, item, entrance or "")
             seen[key] = {
