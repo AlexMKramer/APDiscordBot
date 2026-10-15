@@ -131,6 +131,8 @@ START_INVENTORY_JSON = os.path.join("data", "start_inventory.json")
 _names_memo = {}       # checksum -> (item id -> name, location id -> name)
 _static_memo = {}      # tracker id -> /api/static_tracker response
 _api_warned = False
+_last_hints = None     # unfound hints from the latest API read; None when it came from the pages
+HINTS_JSON = os.path.join("data", "hints.json")
 
 
 def _split_tracker_url(tracker_url):
@@ -217,6 +219,45 @@ def _start_inventories(tracker_url, auth, tracker_id, slots, received_now):
     return known
 
 
+def unfound_hints(api_hints, slot_names, item_names_by_player, location_names_by_player):
+    """Unfound hints from the /api/tracker "hints" list, as readable dicts, sorted.
+
+    Each hint is listed under both its receiver and its finder (and group members), so they are
+    de-duplicated. A hint is a Hint tuple [receiving_player, finding_player, location, item,
+    found, entrance, item_flags, status] or, on a different WebHost, a dict with those keys."""
+    fields = ("receiving_player", "finding_player", "location", "item", "found", "entrance")
+    seen = {}
+    for entry in api_hints or []:
+        team = entry.get("team", 0)
+        for hint in entry.get("hints", []):
+            if isinstance(hint, dict):
+                receiver, finder, location, item, found, entrance = (hint.get(f) for f in fields)
+            else:
+                receiver, finder, location, item, found = hint[:5]
+                entrance = hint[5] if len(hint) > 5 else ""
+            if found:
+                continue
+            key = (team, receiver, finder, location, item, entrance or "")
+            seen[key] = {
+                "receiver": slot_names.get(receiver, f"Player {receiver}"),
+                "item": item_names_by_player.get(receiver, {}).get(item, str(item)),
+                "finder": slot_names.get(finder, f"Player {finder}"),
+                "location": location_names_by_player.get(finder, {}).get(location, str(location)),
+                "entrance": entrance or "",
+            }
+    return sorted(seen.values(), key=lambda h: (h["receiver"].lower(), h["finder"].lower(),
+                                                h["location"].lower(), h["item"].lower()))
+
+
+def load_hints():
+    """The unfound hints last written by the tracker loop, or None if there is no data."""
+    try:
+        with open(HINTS_JSON, encoding="utf-8") as fh:
+            return json.load(fh).get("hints")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _result_from_api(tracker_url, auth):
     """The same {slot: {slot_name: {...}}} shape the page scraper builds, from the JSON API."""
     base, tracker_id = _split_tracker_url(tracker_url)
@@ -233,10 +274,26 @@ def _result_from_api(tracker_url, auth):
         team, player = (int(part) for part in url.rstrip("/").split("/")[-2:])
         item_names, location_names = _names_for(base, packages[game_names[idx]]["checksum"], auth)
         slots.append({"idx": idx, "url": url, "name": slot_names[idx], "team": team, "player": player,
+                      "item_by_id": item_names, "location_by_id": location_names,
                       "item_names": set(item_names.values()), "location_names": set(location_names.values()),
                       "received": _received_names(received.get((team, player), []), item_names),
                       "checked": [location_names.get(loc, str(loc)) for loc in checked.get((team, player), [])]})
     start = _start_inventories(tracker_url, auth, tracker_id, slots, received)
+
+    # Item names belong to the receiving player's game, location names to the finding player's.
+    global _last_hints
+    # A slot whose API names don't match its room (see above) gets ids rather than wrong names.
+    by_player = {slot["player"]: ({**slot, "item_by_id": {}, "location_by_id": {}}
+                                  if start.get(slot["name"], {}).get("page") else slot)
+                 for slot in slots}
+    try:
+        _last_hints = unfound_hints(
+            tracker.get("hints"), {n: s["name"] for n, s in by_player.items()},
+            {n: s["item_by_id"] for n, s in by_player.items()},
+            {n: s["location_by_id"] for n, s in by_player.items()})
+    except Exception as e:
+        print(f"[tracker] could not read hints: {e}")
+        _last_hints = None
 
     result = {}
     for slot in slots:
@@ -266,6 +323,19 @@ def _result_from_api(tracker_url, auth):
             }
         }
     return result
+
+
+def _write_hints(hints):
+    with open(HINTS_JSON + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump({"hints": hints}, fh, indent=2)
+    for attempt in range(10):
+        try:
+            os.replace(HINTS_JSON + ".tmp", HINTS_JSON)
+            break
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.1)
 
 
 def _result_from_pages(tracker_url, auth):
@@ -298,11 +368,13 @@ def _result_from_pages(tracker_url, auth):
 
 
 def get_all_tracker_received_items(tracker_url, auth):
-    global _api_warned
+    global _api_warned, _last_hints
     try:
+        _last_hints = None
         result = _result_from_api(tracker_url, auth)
         _api_warned = False
     except Exception as e:
+        _last_hints = None
         # An older WebHost without the API, or a hiccup: read every slot's page instead.
         if not _api_warned:
             print(f"[tracker] JSON API unavailable, reading every slot page instead: {e}")
@@ -396,6 +468,10 @@ def get_all_tracker_received_items(tracker_url, auth):
             if attempt == 9:
                 raise
             time.sleep(0.1)
+
+    # Hints only come from the API; the page fallback leaves the last file as it was.
+    if _last_hints is not None:
+        _write_hints(_last_hints)
 
     return diff
 

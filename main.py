@@ -13,6 +13,7 @@ import json
 import traceback
 import tracker_download
 import gomode_bot
+import hints_pin
 
 dotenv.load_dotenv()
 discord_token = os.getenv("DISCORD_TOKEN")
@@ -1217,6 +1218,14 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
                 print(f"No changes found at {current_time}")
         except Exception as e:
             print(f"[tracker] item-change check failed (will retry next cycle): {e}")
+
+        # Keep the pinned unfound-hints message(s) current (None: no hint data this run).
+        try:
+            hints = tracker_download.load_hints()
+            if hints is not None:
+                await hints_pin.sync(channel, hints)
+        except Exception as e:
+            print(f"[hints] pinned hints update failed (will retry next cycle): {e}")
 
         # Wait 60 seconds before checking again.
         await asyncio.sleep(60)
