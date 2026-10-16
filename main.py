@@ -1430,29 +1430,22 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
         matching_assignment["tracked_items"] = {item: {"target": 1, "current": 0}
                                                 for item in matching_assignment.get("tracked_items") or []}
 
-    # Check if the item is already being tracked
-    if item_name in matching_assignment["tracked_items"]:
-        if "target" in matching_assignment["tracked_items"][item_name] == target_amount:
-            await initial_response.edit_original_response(
-                content=f"**{item_name}** is already being tracked for **{game_name}** under slot **{slot_name}**.  Current amount: {matching_assignment['tracked_items'][item_name]['current']}."
-            )
-            return
-        elif "target" in matching_assignment["tracked_items"][item_name] != target_amount:
-            await initial_response.edit_original_response(
-                content=f"Now tracking **{item_name}** (target: {target_amount}) for **{game_name}** under slot **{slot_name}**.  Current amount: {matching_assignment['tracked_items'][item_name]['current']}."
-            )
-            matching_assignment["tracked_items"][item_name] = {"target": target_amount, "current": {matching_assignment['tracked_items'][item_name]['current']}}
-    else:
-        # Add the new item to track with its target amount and initial count of 0
-        matching_assignment["tracked_items"][item_name] = {"target": target_amount, "current": 0}
-
-        # Save the updated listeners data back to file
-        with open(listeners_data_json, "w") as f:
-            json.dump(listeners_data, f, indent=4)
-
+    tracked = matching_assignment["tracked_items"]
+    where = f"**{game_name}** under slot **{slot_name}**"
+    if item_name in tracked and tracked[item_name].get("target") == target_amount:
         await initial_response.edit_original_response(
-            content=f"Now tracking **{item_name}** (target: {target_amount}) for **{game_name}** under slot **{slot_name}**."
+            content=f"**{item_name}** is already being tracked for {where}.  Current amount: {tracked[item_name].get('current', 0)}."
         )
+        return
+    # New item, or a new target for one already tracked (the count so far is kept).
+    current = tracked[item_name].get("current", 0) if item_name in tracked else 0
+    tracked[item_name] = {"target": target_amount, "current": current}
+    with open(listeners_data_json, "w") as f:
+        json.dump(listeners_data, f, indent=4)
+    await initial_response.edit_original_response(
+        content=f"Now tracking **{item_name}** (target: {target_amount}) for {where}."
+        + (f"  Current amount: {current}." if current else "")
+    )
 
 
 async def check_tracked_items_loop():
