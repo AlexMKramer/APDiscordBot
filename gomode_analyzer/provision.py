@@ -164,6 +164,13 @@ def provision(seed_zip: str, runtime_dir: str, *, apworlds_src: str | None = Non
     materialize_ap_source(version, ap_path, ap_repo=ap_repo)
     installed, skipped = install_apworlds(apworlds_src, ap_path) if apworlds_src else ([], [])
 
+    # AP fills in host.yaml on its first run. Without one, the first process to load the worlds
+    # has no settings for them (Powerwash Simulator fails to build), so start from an empty file.
+    host_yaml = os.path.join(ap_path, "host.yaml")
+    if not os.path.exists(host_yaml):
+        with open(host_yaml, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+
     manifest = {
         "seed_zip": os.path.abspath(seed_zip),
         "version": tag,
