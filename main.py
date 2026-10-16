@@ -519,6 +519,17 @@ def _resolve_slot_names(slot_names, cache: dict, author_id: str):
     return names, unmatched, None
 
 
+def _without_goal_completed(names):
+    """The slots that have not reached their goal yet."""
+    items_received = gomode_bot._load_items_received()
+    return [n for n in names if not gomode_bot.goal_completed(items_received, n)]
+
+
+def _unsupported_last(names, status):
+    """Slots whose game can't be analyzed go after the rest; the order is kept otherwise."""
+    return sorted(names, key=lambda n: status.get(n, {}).get("status") == "unsupported")
+
+
 def _checks_line(name: str, st: dict) -> str:
     game = st.get("game") or ""
     tag = f" ({game})" if game else ""
@@ -556,7 +567,12 @@ async def checks_in_logic(ctx, slot_names: str = None):
         await initial_response.edit_original_response(content=problem)
         return
 
+    names = _without_goal_completed(names)
+    if not names:
+        await initial_response.edit_original_response(content="Every slot you asked about has reached its goal.")
+        return
     status = await gomode_bot.checks_in_logic(names)
+    names = _unsupported_last(names, status)
     lines = ["**Checks in logic:**"] + [_checks_line(n, status.get(n, {})) for n in names]
     if unmatched:
         lines.append(f"No slots matched: {', '.join(unmatched)}")
@@ -590,6 +606,9 @@ async def which_checks_in_logic(ctx, slot_name: str):
             content=f"**{slot_name}** isn't a slot in the registered seed.")
         return
 
+    if gomode_bot.goal_completed(gomode_bot._load_items_received(), name):
+        await initial_response.edit_original_response(content=f"**{name}** has reached its goal.")
+        return
     st = (await gomode_bot.checks_in_logic([name], list_names=True)).get(name, {})
     message = _checks_line(name, st)
     to_do = st.get("to_do") or []
@@ -1132,23 +1151,19 @@ def format_diff_message(diff):
     underline_start = "[4;2m"
     underline_end = "[0m"
 
-    for slot, slot_data in diff.items():
-        for slot_name, details in slot_data.items():
+    entries = [(slot_name, details) for slot_data in diff.values()
+               for slot_name, details in slot_data.items()]
+    # Slots that reached their goal (and released) go first, in their original order.
+    entries.sort(key=lambda e: "Goal Completed" not in e[1])
 
-            # Add a game completion message if the game status changed to completed.
-            if "Goal Completed" in details:
-                lines.append(f"{underline_start}{slot_name} Goal Completed!  All items released.{underline_end}")
-
-            else:
-
-                header = f"{underline_start}Items received for {slot_name}:{underline_end}"
-                lines.append(header)
-
-                new_items = details.get("New Items", {})
-                for item_name, change in new_items.items():
-                    lines.append(f"{item_name} +{change}")
-
-            lines.append("")  # blank line for separation
+    for slot_name, details in entries:
+        if "Goal Completed" in details:
+            lines.append(f"{underline_start}{slot_name} Goal Completed!  All items released.{underline_end}")
+        else:
+            lines.append(f"{underline_start}Items received for {slot_name}:{underline_end}")
+        for item_name, change in details.get("New Items", {}).items():
+            lines.append(f"{item_name} +{change}")
+        lines.append("")  # blank line for separation
     return "\n".join(lines)
 
 
@@ -1684,11 +1699,13 @@ async def _run_go_mode_notifications():
         return [a for a in slot_to_authors[sn]
                 if tok(a, sn) not in notified and (seed, a, sn) not in _go_mode_dm_sent]
 
-    candidate_slots = [sn for sn in slot_to_authors if pending_authors(sn)]
+    items_received = gomode_bot._load_items_received()
+
+    # A slot that already reached its goal has no use for a go-mode alert.
+    candidate_slots = [sn for sn in slot_to_authors
+                       if pending_authors(sn) and not gomode_bot.goal_completed(items_received, sn)]
     if not candidate_slots:
         return
-
-    items_received = gomode_bot._load_items_received()
 
     # Throttle: a slot can't reach go mode without its inventory changing, and each check
     # rebuilds its world. Skip slots whose inventory is unchanged since the last "not yet".

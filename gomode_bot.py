@@ -187,6 +187,16 @@ def _load_items_received() -> dict:
         return {}
 
 
+def goal_completed(items_received: dict, slot_name: str) -> bool:
+    """True once the tracker shows the slot has reached its goal ("Game Status" is "Goal
+    Completed" in items_received.json, whether read from the API path or the HTML pages)."""
+    for slot_entry in (items_received or {}).values():
+        if slot_name in slot_entry:
+            return str(slot_entry[slot_name].get("Game Status", "")).strip().lower() in (
+                "goal completed", "completed")
+    return False
+
+
 def inventory_for_slot(items_received: dict, slot_name: str) -> dict:
     """Aggregate {item_name: total_count} for a slot from items_received.json, whose shape is
     {slot_num: {slot_name: {"Items": {key: {item_name, amount}}}}}."""
