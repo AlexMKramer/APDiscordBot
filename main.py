@@ -1151,17 +1151,23 @@ def format_diff_message(diff):
     underline_start = "[4;2m"
     underline_end = "[0m"
 
-    entries = [(slot_name, details) for slot_data in diff.values()
-               for slot_name, details in slot_data.items()]
-    # Slots that reached their goal (and released) go first, in their original order.
-    entries.sort(key=lambda e: "Goal Completed" not in e[1])
+    entries = sorted(((slot_name, details) for slot_data in diff.values()
+                      for slot_name, details in slot_data.items()),
+                     key=lambda e: e[0].lower())
+    # Slots that reached their goal this cycle are announced first.
+    goals = [name for name, details in entries if "Goal Completed" in details]
+    for name in goals:
+        lines.append(f"{underline_start}{name} Goal Completed!{underline_end}")
+    if goals:
+        lines.append("")
 
+    # Then every slot that received items, goal slots included, alphabetically.
     for slot_name, details in entries:
-        if "Goal Completed" in details:
-            lines.append(f"{underline_start}{slot_name} Goal Completed!  All items released.{underline_end}")
-        else:
-            lines.append(f"{underline_start}Items received for {slot_name}:{underline_end}")
-        for item_name, change in details.get("New Items", {}).items():
+        new_items = details.get("New Items", {})
+        if not new_items:
+            continue
+        lines.append(f"{underline_start}Items received for {slot_name}:{underline_end}")
+        for item_name, change in new_items.items():
             lines.append(f"{item_name} +{change}")
         lines.append("")  # blank line for separation
     return "\n".join(lines)
