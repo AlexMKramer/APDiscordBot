@@ -14,6 +14,7 @@ import traceback
 import tracker_download
 import gomode_bot
 import hints_pin
+import hint_client
 
 dotenv.load_dotenv()
 discord_token = os.getenv("DISCORD_TOKEN")
@@ -241,12 +242,130 @@ async def slot_name_for_assigned_game_autocomplete(ctx: discord.AutocompleteCont
     return suggestions
 
 
+# ---- /hint -------------------------------------------------------------------------------
+# The Archipelago server address for hints: AP_SERVER_ADDRESS in the environment, else the
+# address last given to /get_server_data (remembered in data/server_address.txt).
+_SERVER_ADDRESS_FILE = os.path.join("data", "server_address.txt")
+_hint_locks = {}
+
+
+def _remember_server_address(address):
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(_SERVER_ADDRESS_FILE, "w", encoding="utf-8") as f:
+            f.write(address.strip())
+    except OSError:
+        pass
+
+
+def _ap_server_address():
+    env = os.getenv("AP_SERVER_ADDRESS")
+    if env and env.strip():
+        return env.strip()
+    try:
+        with open(_SERVER_ADDRESS_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _slot_game(slot_name):
+    """(canonical slot name, game) from slot_info.json, matched case-insensitively; (None, None) if unknown."""
+    try:
+        with open(os.path.join("data", "slot_info.json"), "r") as f:
+            slot_info = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    for info in slot_info.values():
+        if info.get("slot_name", "").lower() == (slot_name or "").strip().lower():
+            return info.get("slot_name"), info.get("game")
+    return None, None
+
+
+def _can_hint_slot(ctx, canonical_slot):
+    """Hinting spends the slot's hint points: only the bot owner or a user who assigned that slot may."""
+    if is_owner(ctx):
+        return True
+    try:
+        with open(os.path.join("data", "listeners.json"), "r") as f:
+            mine = json.load(f).get(str(ctx.author.id), [])
+    except (OSError, json.JSONDecodeError):
+        return False
+    return any(a.get("slot_name", "").lower() == canonical_slot.lower() for a in mine)
+
+
+async def hint_item_autocomplete(ctx: discord.AutocompleteContext):
+    _, game = _slot_game(ctx.options.get("slot_name"))
+    if not game:
+        return []
+    for entry in _load_data_package():
+        if entry.get("game") == game:
+            names = sorted(entry.get("item_name_to_id", {}))
+            typed = (ctx.value or "").lower()
+            starts = [n for n in names if n.lower().startswith(typed)]
+            has = [n for n in names if typed in n.lower() and not n.lower().startswith(typed)]
+            return (starts + has)[:25]
+    return []
+
+
+@bot.slash_command(description="Ask the Archipelago server for a hint on an item in a slot (spends that slot's hint points).")
+@option("slot_name", description="The slot to hint for.", autocomplete=slot_name_autocomplete, required=True)
+@option("item", description="The item to get a hint for.", autocomplete=hint_item_autocomplete, required=True)
+@option("password", description="The slot's password, if it has one. Not stored.", required=False)
+async def hint(ctx, slot_name: str, item: str, password: str = None):
+    initial_response = await ctx.respond("Asking the server for a hint...", ephemeral=True)
+    item = " ".join((item or "").split())
+
+    canonical, _game = _slot_game(slot_name)
+    if not canonical:
+        await initial_response.edit_original_response(
+            content=f"{slot_name} not found. Check spelling, or run /get_server_data first.")
+        return
+    if not item:
+        await initial_response.edit_original_response(content="Enter the item you want a hint for.")
+        return
+    if not _can_hint_slot(ctx, canonical):
+        await initial_response.edit_original_response(
+            content=f"You can only get hints for slots you assigned to yourself with /assign_slot. "
+                    f"Run /assign_slot {canonical} first.")
+        return
+    address = _ap_server_address()
+    if not address:
+        await initial_response.edit_original_response(
+            content="I don't know the server address yet. Run /get_server_data first.")
+        return
+
+    lock = _hint_locks.setdefault(canonical.lower(), asyncio.Lock())
+    if lock.locked():
+        await initial_response.edit_original_response(content=f"A hint for {canonical} is already in progress. Try again in a moment.")
+        return
+    async with lock:
+        result = await hint_client.request_hint(address, canonical, password, item,
+                                                data_package=_load_data_package())
+
+    if result.status == "ok":
+        body = "\n".join(result.lines) or "The server gave no answer."
+        content = f"**/hint {canonical}: {item}**\n{body}"
+        if result.lines and any(l.startswith("[Hint]") for l in result.lines):
+            content += "\nIt will show in the pinned unfound hints message on the next tracker check."
+    elif result.status == "refused":
+        content = f"The server refused the connection: {result.detail}."
+    elif result.status == "timeout":
+        content = "The server did not answer in time. Try again."
+    elif result.status == "unreachable":
+        content = "Could not reach the Archipelago server."
+    else:
+        content = "Something went wrong asking for the hint."
+    await initial_response.edit_original_response(content=content[:1900])
+
+
 @bot.slash_command(description="Enter the server address, the bot's slot name, and the password to connect to a server.")
 @option("server_address", description="Enter the server address and port.", required = True)
 @option("slot_name", description="Enter the bot's slot name.", required = True)
 @option("password", description="Enter the server password.", required = False)
 async def get_server_data(ctx, server_address: str, slot_name: str, password: str = None):
     initial_response = await ctx.respond("Connecting to server...")
+    _remember_server_address(server_address)
 
     # ap_connector.main runs the websocket session, which stays open while connected.
     # Launch it in the background instead of awaiting it here -- awaiting would block
