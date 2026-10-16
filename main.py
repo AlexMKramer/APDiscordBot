@@ -763,7 +763,7 @@ async def assign_slot(ctx, slot_name: str):
             "slot_name": name,
             "game": game_name,
             "items": [],  # list to hold the items the user is tracking
-            "tracked_items": []
+            "tracked_items": {}
         })
         existing_names.add(name.lower())
         newly_assigned.append(name)
@@ -1425,8 +1425,10 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
         return
 
     # Ensure the assignment has a "tracked_items" dictionary to store tracked items
-    if "tracked_items" not in matching_assignment:
-        matching_assignment["tracked_items"] = {}
+    if not isinstance(matching_assignment.get("tracked_items"), dict):
+        # Older assignments, and ones just made by /assign_slot before this fix, hold a list.
+        matching_assignment["tracked_items"] = {item: {"target": 1, "current": 0}
+                                                for item in matching_assignment.get("tracked_items") or []}
 
     # Check if the item is already being tracked
     if item_name in matching_assignment["tracked_items"]:
