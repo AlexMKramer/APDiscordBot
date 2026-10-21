@@ -377,6 +377,120 @@ def _result_from_pages(tracker_url, auth):
     return result
 
 
+ANNOUNCED_JSON = os.path.join("data", "announced_marks.json")
+
+
+def _int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _item_counts(items):
+    """{item name: total count} from a slot's "Items" dict (anything else counts as empty)."""
+    counts = {}
+    if isinstance(items, dict):
+        for item in items.values():
+            name = item.get("item_name", "Unknown")
+            counts[name] = counts.get(name, 0) + _int(item.get("amount", 0))
+    return counts
+
+
+def _marks_from_result(result):
+    """Marks matching a saved result: its item counts, and the slots whose goal was completed."""
+    marks = {"items": {}, "goals": []}
+    for slot_data in (result or {}).values():
+        if not isinstance(slot_data, dict):
+            continue
+        for slot_name, details in slot_data.items():
+            if not isinstance(details, dict):
+                continue
+            marks["items"][slot_name] = _item_counts(details.get("Items"))
+            if _goal_done(details):
+                marks["goals"].append(slot_name)
+    return marks
+
+
+def _goal_done(details):
+    return str(details.get("Game Status", "")).strip().lower() in ("goal completed", "completed")
+
+
+def _load_marks(tracker_id, old_result):
+    """The announced marks for this room: {"tracker", "items": {slot: {item: count}}, "goals": [slot]}.
+
+    A different room starts from nothing. With no marks file yet, they start from the last saved
+    result so an update does not announce the whole inventory again."""
+    try:
+        with open(ANNOUNCED_JSON, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if saved.get("tracker") != tracker_id:
+            return {"tracker": tracker_id, "items": {}, "goals": []}
+        return {"tracker": tracker_id, "items": saved.get("items", {}), "goals": list(saved.get("goals", []))}
+    except (OSError, ValueError, AttributeError):
+        marks = _marks_from_result(old_result)
+        marks["tracker"] = tracker_id
+        return marks
+
+
+def _save_marks(marks):
+    with open(ANNOUNCED_JSON + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(marks, fh)
+    for attempt in range(10):
+        try:
+            os.replace(ANNOUNCED_JSON + ".tmp", ANNOUNCED_JSON)
+            break
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.1)
+
+
+def _diff_against_marks(result, marks):
+    """What is new in `result` since the marks, as {slot: {slot name: {"New Items": {...},
+    "Goal Completed": status}}}. Raises the marks to the new counts and lifts `result` in place
+    to at least the marked counts and a completed goal."""
+    diff = {}
+    for slot, slot_data in result.items():
+        for slot_name, details in slot_data.items():
+            marked = marks["items"].setdefault(slot_name, {})
+            items = details.get("Items")
+            counts = _item_counts(items)
+            diff_items = {}
+            for name, count in counts.items():
+                if count > marked.get(name, 0):
+                    diff_items[name] = count - marked.get(name, 0)
+                    marked[name] = count
+            if isinstance(items, dict):
+                # Lift anything that read below its mark back up, so the saved result never drops.
+                for name, count in marked.items():
+                    deficit = count - counts.get(name, 0)
+                    if deficit <= 0:
+                        continue
+                    entry = next((e for e in items.values() if e.get("item_name") == name), None)
+                    if entry is not None:
+                        entry["amount"] = _int(entry.get("amount")) + deficit
+                    else:
+                        key = len(items) + 1
+                        while str(key) in items:
+                            key += 1
+                        items[str(key)] = {"item_name": name, "amount": deficit}
+
+            diff_entry = {}
+            if diff_items:
+                diff_entry["New Items"] = diff_items
+            status = str(details.get("Game Status", "")).strip()
+            if slot_name in marks["goals"]:
+                if not _goal_done(details):
+                    details["Game Status"] = "Goal Completed"
+            elif _goal_done(details):
+                marks["goals"].append(slot_name)
+                diff_entry["Goal Completed"] = status
+            if diff_entry:
+                diff.setdefault(slot, {})[slot_name] = diff_entry
+    return diff
+
+
 def get_all_tracker_received_items(tracker_url, auth):
     with _read_lock:
         return _read_tracker(tracker_url, auth)
@@ -412,66 +526,18 @@ def _read_tracker(tracker_url, auth):
             print(f"Error loading old items_received file: {e}")
             old_result = {}
 
-    # Compute diff: aggregate amounts by item name for new and old results,
-    # then record the positive differences. Also, check for changes in game status (completed).
-    diff = {}
-    for slot, new_slot_data in result.items():
-        # new_slot_data is a dict with a single key: the slot name.
-        for slot_name_key, new_details in new_slot_data.items():
-            new_items = new_details.get("Items", {})
-            # Aggregate new items by item name.
-            new_agg = {}
-            if isinstance(new_items, dict):
-                for key, item in new_items.items():
-                    name = item.get("item_name", "Unknown")
-                    try:
-                        amount = int(item.get("amount", 0))
-                    except:
-                        amount = 0
-                    new_agg[name] = new_agg.get(name, 0) + amount
-
-            # Aggregate old items for the same slot.
-            old_agg = {}
-            if slot in old_result:
-                old_slot_data = old_result[slot]
-                if slot_name_key in old_slot_data:
-                    old_details = old_slot_data[slot_name_key]
-                    old_items = old_details.get("Items", {})
-                    if isinstance(old_items, dict):
-                        for key, item in old_items.items():
-                            name = item.get("item_name", "Unknown")
-                            try:
-                                amount = int(item.get("amount", 0))
-                            except:
-                                amount = 0
-                            old_agg[name] = old_agg.get(name, 0) + amount
-
-            # Compare aggregated values.
-            diff_items = {}
-            for name, new_total in new_agg.items():
-                old_total = old_agg.get(name, 0)
-                if new_total > old_total:
-                    diff_items[name] = new_total - old_total
-
-            # Check game status for completion.
-            new_game_status = new_details.get("Game Status", "").strip()
-            old_game_status = ""
-            if slot in old_result:
-                old_slot_data = old_result[slot]
-                if slot_name_key in old_slot_data:
-                    old_game_status = old_slot_data[slot_name_key].get("Game Status", "").strip()
-
-            # We consider the game completed if the new status equals "Game Completed!" or "Completed" (case-insensitive).
-            is_completed = new_game_status.lower() in ["goal completed", "completed"]
-
-            diff_entry = {}
-            if diff_items:
-                diff_entry["New Items"] = diff_items
-            if is_completed and (new_game_status != old_game_status):
-                diff_entry["Goal Completed"] = new_game_status
-
-            if diff_entry:
-                diff.setdefault(slot, {})[slot_name_key] = diff_entry
+    # The WebHost can serve an older copy of the tracker between two newer ones (separate caches
+    # per worker, or the API and the pages cached apart). Counts are therefore compared with the
+    # highest count already announced, not with the previous read, and the saved result never
+    # goes below it: a stale copy neither re-announces an item when the count rises back nor
+    # makes it vanish from the inventory other loops read.
+    try:
+        tracker_id = _split_tracker_url(tracker_url)[1]
+    except ValueError:
+        tracker_id = tracker_url
+    marks = _load_marks(tracker_id, old_result)
+    diff = _diff_against_marks(result, marks)
+    _save_marks(marks)
 
     # Write to a temp file and swap it in: other loops read this file while it's being written,
     # and a half-written file reads as empty (no items, nothing checked).
