@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 
 from bs4 import BeautifulSoup
@@ -131,6 +132,8 @@ START_INVENTORY_JSON = os.path.join("data", "start_inventory.json")
 _names_memo = {}       # checksum -> (item id -> name, location id -> name)
 _static_memo = {}      # tracker id -> /api/static_tracker response
 _api_warned = False
+last_source = "api"   # where the latest read came from: "api" or "pages" (the slow fallback)
+_read_lock = threading.Lock()   # one read at a time: it rewrites items_received.json and diffs against it
 _last_hints = None     # unfound hints from the latest API read; None when it came from the pages
 HINTS_JSON = os.path.join("data", "hints.json")
 
@@ -375,12 +378,19 @@ def _result_from_pages(tracker_url, auth):
 
 
 def get_all_tracker_received_items(tracker_url, auth):
-    global _api_warned, _last_hints
+    with _read_lock:
+        return _read_tracker(tracker_url, auth)
+
+
+def _read_tracker(tracker_url, auth):
+    global _api_warned, _last_hints, last_source
     try:
         _last_hints = None
         result = _result_from_api(tracker_url, auth)
         _api_warned = False
+        last_source = "api"
     except Exception as e:
+        last_source = "pages"
         _last_hints = None
         # An older WebHost without the API, or a hiccup: read every slot's page instead.
         if not _api_warned:

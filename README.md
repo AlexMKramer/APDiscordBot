@@ -1,7 +1,7 @@
 # APDiscordBot
 This is a Python based Discord Bot for interacting with an Archipelago Multiworld server.
 
-The bot will announce items received once a minute to a specific channel, can be used to get a list of all of the items received for a specific slot or a list of slots that you assign to yourself, and can even be used to track specific items for a slot to get a DM when you receive it.
+The bot will announce items received to a specific channel within seconds of them showing up on the tracker (it reads the tracker every 10 seconds; set `FEED_POLL_SECONDS` to change that), can be used to get a list of all of the items received for a specific slot or a list of slots that you assign to yourself, and can even be used to track specific items for a slot to get a DM when you receive it.
 
 ## Setup
 

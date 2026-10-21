@@ -1292,8 +1292,37 @@ def format_diff_message(diff):
     return "\n".join(lines)
 
 
+# How often the tracker is read for the feed. The WebHost only refreshes its data every so often
+# (the server's save and the tracker's cache), so reading more often than ~10 s gains nothing.
+FEED_POLL_DEFAULT = 10.0
+FEED_POLL_MIN = 5.0
+# When the JSON API is down the read falls back to one HTTP call per slot page (~8 s on a big
+# seed), which is too heavy to repeat every few seconds.
+FEED_POLL_PAGES_FALLBACK = 60.0
+
+
+def _feed_poll_seconds():
+    """FEED_POLL_SECONDS from the environment (default 10, never below 5)."""
+    try:
+        value = float(os.getenv("FEED_POLL_SECONDS", "").strip() or FEED_POLL_DEFAULT)
+    except ValueError:
+        value = FEED_POLL_DEFAULT
+    return max(FEED_POLL_MIN, value)
+
+
+def _next_poll_delay(interval, elapsed, source="api"):
+    """Seconds to sleep before the next read, so reads start about `interval` apart. The loop
+    awaits each read before sleeping, so two reads can never overlap; a slow read just shortens
+    the sleep (never below 1 s, or half the interval if that is shorter) instead of stacking up."""
+    if source == "pages":
+        interval = max(interval, FEED_POLL_PAGES_FALLBACK)
+    return max(min(1.0, interval / 2), interval - elapsed)
+
+
 async def no_dm_tracker(tracker_url, auth):
+    interval = _feed_poll_seconds()
     while True:
+        started = time.monotonic()
         # get_all_tracker_received_items is BLOCKING (synchronous requests, one HTTP call per
         # slot). Run it in a thread so it can't stall the event loop and make the bot miss
         # Discord's 3s interaction-ack window (error 10062 "Unknown interaction").
@@ -1304,7 +1333,8 @@ async def no_dm_tracker(tracker_url, auth):
                 None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
         except Exception as e:
             print(f"[tracker] scrape failed (will retry next cycle): {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(_next_poll_delay(interval, time.monotonic() - started,
+                                             tracker_download.last_source))
 
 
 async def _hide_filler(diff):
@@ -1320,7 +1350,7 @@ async def _hide_filler(diff):
         return diff
 
 
-# Loop function to check for changes every 60 seconds and send a DM to a specific channel.
+# Loop function to check for changes every FEED_POLL_SECONDS (10 s) and post them to the feed channel.
 async def check_for_item_changes(tracker_url, auth, channel_id):
     await bot.wait_until_ready()
     channel = bot.get_channel(int(channel_id))
@@ -1328,7 +1358,11 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
         print(f"Channel with ID {channel_id} not found.")
         return
 
+    interval = _feed_poll_seconds()
+    print(f"[feed] reading the tracker every {interval:g}s")
+    quiet_cycles = 0
     while not bot.is_closed():
+        started = time.monotonic()
         # Get the new diff from tracker data. This is BLOCKING (synchronous requests, one HTTP
         # call per slot -- ~8s for a large seed), so run it in a thread; otherwise it stalls the
         # event loop and the bot misses Discord's 3s interaction-ack window (error 10062, seen as
@@ -1354,8 +1388,12 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
                 chunks = chunk_text_by_line(message, max_content_length)
                 for chunk in chunks:
                     await channel.send(f"```ansi\n{chunk}\n```")
+                quiet_cycles = 0
             else:
-                print(f"No changes found at {current_time}")
+                # Log a quiet spell about once every 5 minutes, not on every read.
+                quiet_cycles += 1
+                if quiet_cycles % max(1, round(300 / interval)) == 1:
+                    print(f"No changes found at {current_time}")
         except Exception as e:
             print(f"[tracker] item-change check failed (will retry next cycle): {e}")
 
@@ -1367,12 +1405,13 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
         except Exception as e:
             print(f"[hints] pinned hints update failed (will retry next cycle): {e}")
 
-        # Wait 60 seconds before checking again.
-        await asyncio.sleep(60)
+        # Wait out the rest of the interval before reading again (see _next_poll_delay).
+        await asyncio.sleep(_next_poll_delay(interval, time.monotonic() - started,
+                                             tracker_download.last_source))
 
 
 # --- Hourly completion-percentage update ----------------------------------------------------
-# The tracker loop above rewrites data/items_received.json every 60s, so this loop just reads
+# The tracker loop above rewrites data/items_received.json every feed poll, so this loop just reads
 # the per-slot "Checks Status" cells out of that file -- it makes no extra HTTP requests. The
 # last announced figure is persisted so a bot restart neither re-announces nor loses it.
 percentage_state_json = os.path.join("data", "percentage_state.json")
