@@ -1877,7 +1877,7 @@ async def _run_unstuck_alerts():
                 user = await bot.fetch_user(int(user_id))
                 if user:
                     await user.send(msg)
-                    log_goal.info("Told %s that %s has checks in logic again", user.name, name)
+                    log_goal.info("Told %s that %s has checks in logic again", getattr(user, "name", user_id), name)
             except discord.Forbidden:
                 log_error.warning("Could not DM Discord user %s the unstuck alert for %s (DMs disabled)", user_id, name)
             except Exception as e:
@@ -1981,12 +1981,13 @@ async def _run_go_mode_notifications():
                 user = await bot.fetch_user(int(author_id))
                 if user:
                     await user.send(msg)
-                    log_goal.info("Told %s that %s reached go mode", user.name, sn)
                     # Mark notified ONLY after the DM actually sends, so a closed-DM/transient
                     # failure is retried next cycle instead of being silently lost.
                     notified.add(tok(author_id, sn))
                     _go_mode_dm_sent.add((seed, author_id, sn))
                     changed = True
+                    # Logged after the bookkeeping, so a logging problem can never cause a repeat DM.
+                    log_goal.info("Told %s that %s reached go mode", getattr(user, "name", author_id), sn)
             except discord.Forbidden:
                 log_error.warning("Could not DM Discord user %s that %s reached go mode (DMs disabled)", author_id, sn)
             except Exception as e:
