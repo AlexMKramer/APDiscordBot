@@ -477,6 +477,14 @@ def _load_listeners() -> dict:
         return {}
 
 
+def _why_unsupported(st: dict) -> str:
+    """The analyzer's reason a slot can't be checked, as ' (reason)' for a reply line; '' if none."""
+    reason = " ".join(str(st.get("reason") or "").split())
+    if len(reason) > 160:
+        reason = reason[:157] + "..."
+    return f" ({reason})" if reason else ""
+
+
 def _go_mode_overview_line(name: str, st: dict) -> str:
     game = st.get("game") or ""
     tag = f" ({game})" if game else ""
@@ -486,7 +494,7 @@ def _go_mode_overview_line(name: str, st: dict) -> str:
     if status == "tracker_mismatch":
         return f"• {name}{tag} — tracker shows a different game; is the right seed registered?"
     if status == "unsupported":
-        return f"• {name}{tag} — go-mode tracking not supported for this game"
+        return f"• {name}{tag} — go-mode tracking not supported for this game{_why_unsupported(st)}"
     if status not in ("ok",):  # "error" or anything transient
         return f"• {name}{tag} — couldn't check right now, try again shortly"
     igm = st.get("in_go_mode")
@@ -511,7 +519,7 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str):
     status = res.get("status")
     if status == "unsupported":
         await initial_response.edit_original_response(
-            content=f"{header}\nGo-mode tracking isn't supported for this game yet.")
+            content=f"{header}\nGo-mode tracking isn't supported for this game yet.{_why_unsupported(res)}")
         return
     if status != "ok":  # "error" -- a transient build/subprocess failure, not "unsupported"
         await initial_response.edit_original_response(
@@ -658,7 +666,7 @@ def _checks_line(name: str, st: dict) -> str:
     if status == "tracker_mismatch":
         return f"• {name}{tag} — tracker shows a different game; is the right seed registered?"
     if status == "unsupported":
-        return f"• {name}{tag} — not supported for this game"
+        return f"• {name}{tag} — not supported for this game{_why_unsupported(st)}"
     if status != "ok":
         return f"• {name}{tag} — couldn't check right now, try again shortly"
     total, done = st.get("total", 0), st.get("done", 0)
