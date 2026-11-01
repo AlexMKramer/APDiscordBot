@@ -22,6 +22,12 @@ import json
 import os
 import sys
 
+import log_setup
+
+log_goal = log_setup.get('goal')
+log_checks = log_setup.get('checks')
+log_error = log_setup.get('error')
+
 ANALYZER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gomode_analyzer")
 
 # --- configuration (environment) --------------------------------------------
@@ -187,6 +193,31 @@ def _load_items_received() -> dict:
         return {}
 
 
+_go_mode_seen: dict = {}
+_checks_seen: dict = {}
+
+
+def _log_change(memo: dict, name: str, value, logger, text: str, *args) -> None:
+    """Log a result the first time it is seen and whenever it changes (the loops repeat it every minute)."""
+    if memo.get(name) != value:
+        memo[name] = value
+        logger.info(text, *args)
+
+
+def _why(st: dict) -> str:
+    """Plain words for a slot status that is not 'ok' (the reason, when the analyzer gave one)."""
+    status = st.get("status") or "unknown"
+    reason = (st.get("reason") or "").strip()
+    return f"{status}: {reason[:120]}" if reason else status
+
+
+def _go_mode_words(st: dict) -> str:
+    if st.get("status") != "ok":
+        return f"not checked ({_why(st)})"
+    igm = st.get("in_go_mode")
+    return "in go mode" if igm is True else "not in go mode yet" if igm is False else "could not tell"
+
+
 def goal_completed(items_received: dict, slot_name: str) -> bool:
     """True once the tracker shows the slot has reached its goal ("Game Status" is "Goal
     Completed" in items_received.json, whether read from the API path or the HTML pages)."""
@@ -278,8 +309,8 @@ class _Worker:
             await self._stop()
             raise RuntimeError(f"analyzer worker didn't start; see {WORKER_LOG}")
         self.key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"))
-        print(f"[worker] ready: seed {ready.get('seed')}, {ready.get('built')}/{ready.get('slots')} "
-              f"slots built in {ready.get('seconds')}s")
+        log_setup.get('start').info("Go-mode analyzer ready: seed %s, %s of %s slots built in %ss",
+                                    ready.get('seed'), ready.get('built'), ready.get('slots'), ready.get('seconds'))
 
     async def request(self, op: str, **payload):
         reg = load_registry()
@@ -324,7 +355,7 @@ async def warm_worker() -> None:
     try:
         await _worker.request("ping")
     except Exception as e:  # noqa: BLE001 -- a later query will retry
-        print(f"[worker] couldn't start: {e}")
+        log_error.exception("Go-mode analyzer could not start: %s", e)
 
 
 async def go_mode_status(slot_names, *, items_received: dict | None = None) -> dict:
@@ -368,7 +399,7 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
         try:
             oracle = await _worker.request("go_mode", slots=batch)
         except Exception as e:  # noqa: BLE001 -- leave in_go_mode None; the next cycle retries
-            print(f"[go-mode] analyzer request failed: {e}")
+            log_error.exception("Go-mode analyzer request failed, will retry next cycle: %s", e)
             oracle = {}
         for name, info in oracle.items():
             if name in result:
@@ -376,6 +407,9 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
                 if info.get("status") and info["status"] != "ok":
                     result[name]["status"] = info["status"]
                     result[name]["reason"] = info.get("reason", "")
+    for name, st in result.items():
+        _log_change(_go_mode_seen, name, (st.get("status"), st.get("in_go_mode")), log_goal,
+                    "Go mode for %s (%s): %s", name, st.get("game") or "unknown game", _go_mode_words(st))
     return result
 
 
@@ -440,11 +474,18 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None,
         try:
             checks = await _worker.request("checks", slots=batch)
         except Exception as e:  # noqa: BLE001 -- slots stay "couldn't check right now"
-            print(f"[checks] analyzer request failed: {e}")
+            log_error.exception("Checks analyzer request failed: %s", e)
             checks = {}
         for name, info in checks.items():
             if name in result:
                 result[name] = {**info, "game": result[name].get("game")}
+    for name, st in result.items():
+        if st.get("status") == "ok":
+            words = f"{st.get('done', 0)} of {st.get('total', 0)} checks done, {st.get('in_logic_done', 0)} of {st.get('in_logic', 0)} in logic done"
+        else:
+            words = f"not checked ({_why(st)})"
+        _log_change(_checks_seen, name, words, log_checks, "Checks for %s (%s): %s",
+                    name, st.get("game") or "unknown game", words)
     return result
 
 
@@ -495,7 +536,7 @@ async def load_item_flags() -> dict | None:
         result = await _worker.request("item_flags")
     except Exception as e:  # noqa: BLE001
         result = None
-        print(f"[item-flags] could not read item classifications: {e}")
+        log_error.exception("Could not read item classifications: %s", e)
     if not result or result.get("seed") != seed:
         # Remembered for this run so a broken setup doesn't retry every minute; registering a
         # seed (a new seed key) tries again.

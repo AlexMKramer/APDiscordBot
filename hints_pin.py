@@ -10,6 +10,10 @@ import os
 
 import discord
 
+import log_setup
+
+log = log_setup.get("hints")
+
 STATE_JSON = os.path.join("data", "hints_pin_state.json")
 MAX_LEN = 1900
 EMPTY_TEXT = "**Unfound hints**\nNone right now."
@@ -72,10 +76,10 @@ async def _pin(message):
         await message.pin()
     except discord.Forbidden:
         if not _pin_warned:
-            print("[hints] cannot pin (needs Manage Messages); keeping the hints message unpinned")
+            log.warning("Cannot pin the hints message (the bot needs Manage Messages); leaving it unpinned")
             _pin_warned = True
     except discord.HTTPException as e:
-        print(f"[hints] pin failed: {e}")
+        log.error("Pinning the hints message failed: %s", e)
 
 
 async def sync(channel, hints, load_state=_load_state, save_state=_save_state):
@@ -106,6 +110,6 @@ async def sync(channel, hints, load_state=_load_state, save_state=_save_state):
         except discord.NotFound:
             pass
         except discord.HTTPException as e:
-            print(f"[hints] could not delete old hints message {stale_id}: {e}")
+            log.error("Could not delete an old hints message: %s", e)
     if new_ids != old_ids:
         save_state(new_ids)

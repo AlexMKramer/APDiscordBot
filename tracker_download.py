@@ -6,6 +6,11 @@ import time
 from bs4 import BeautifulSoup
 import requests
 
+import log_setup
+
+log = log_setup.get('conn')
+log_error = log_setup.get('error')
+
 
 def get_tracker_urls(tracker_url, auth):
     # Always pass a timeout: without one a stalled connection hangs indefinitely (the default
@@ -302,7 +307,7 @@ def _result_from_api(tracker_url, auth):
             {n: s["item_by_id"] for n, s in by_player.items()},
             {n: s["location_by_id"] for n, s in by_player.items()})
     except Exception as e:
-        print(f"[tracker] could not read hints: {e}")
+        log_error.exception("Could not read the tracker hints: %s", e)
         _last_hints = None
 
     result = {}
@@ -486,6 +491,7 @@ def _diff_against_marks(result, marks):
             elif _goal_done(details):
                 marks["goals"].append(slot_name)
                 diff_entry["Goal Completed"] = status
+                log_setup.get('goal').info("Goal complete: %s (%s)", slot_name, details.get("Game Name") or "unknown game")
             if diff_entry:
                 diff.setdefault(slot, {})[slot_name] = diff_entry
     return diff
@@ -501,6 +507,8 @@ def _read_tracker(tracker_url, auth):
     try:
         _last_hints = None
         result = _result_from_api(tracker_url, auth)
+        if _api_warned:
+            log.info("Tracker JSON API is back")
         _api_warned = False
         last_source = "api"
     except Exception as e:
@@ -508,7 +516,7 @@ def _read_tracker(tracker_url, auth):
         _last_hints = None
         # An older WebHost without the API, or a hiccup: read every slot's page instead.
         if not _api_warned:
-            print(f"[tracker] JSON API unavailable, reading every slot page instead: {e}")
+            log.warning("Tracker JSON API unavailable, reading every slot page instead: %s", e)
             _api_warned = True
         result = _result_from_pages(tracker_url, auth)
 
@@ -523,7 +531,7 @@ def _read_tracker(tracker_url, auth):
             with open(items_received_json, "r") as infile:
                 old_result = json.load(infile)
         except Exception as e:
-            print(f"Error loading old items_received file: {e}")
+            log_error.exception("Could not read the old items_received file, starting from nothing: %s", e)
             old_result = {}
 
     # The WebHost can serve an older copy of the tracker between two newer ones (separate caches
@@ -589,7 +597,7 @@ def overall_completion(items_received=None):
             with open(items_received_json, "r") as infile:
                 items_received = json.load(infile)
         except Exception as e:
-            print(f"[percentage] could not read {items_received_json}: {e}")
+            log_error.exception("Could not read %s: %s", os.path.basename(items_received_json), e)
             return None
 
     total_checked = 0

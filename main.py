@@ -10,13 +10,24 @@ import datetime
 import fnmatch
 import ap_connector
 import json
-import traceback
 import tracker_download
 import gomode_bot
 import hints_pin
 import hint_client
+import log_setup
+import platform
+from urllib.parse import urlparse
 
 dotenv.load_dotenv()
+log_path = log_setup.setup()
+log_start = log_setup.get("start")
+log_config = log_setup.get("config")
+log_conn = log_setup.get("conn")
+log_feed = log_setup.get("feed")
+log_cmd = log_setup.get("cmd")
+log_goal = log_setup.get("goal")
+log_hints = log_setup.get("hints")
+log_error = log_setup.get("error")
 discord_token = os.getenv("DISCORD_TOKEN")
 discord_channel_id = os.getenv("DISCORD_CHANNEL_ID")
 tracker_url = os.getenv("TRACKER_URL")
@@ -27,6 +38,19 @@ if url_auth_username and tracker_password:
     auth = (url_auth_username, tracker_password)
 else:
     auth = None
+
+log_start.info("AP Discord bot starting. Python %s, py-cord %s", platform.python_version(), discord.__version__)
+log_config.info("Tracker host %s, tracker login %s, feed channel %s, go-mode owner %s, log level %s",
+                urlparse(tracker_url or "").hostname or "not set",
+                "set" if auth else "not set",
+                "set" if discord_channel_id else "not set",
+                "set" if (os.getenv("GOMODE_OWNER_ID") or os.getenv("OWNER_ID")) else "guild owner",
+                (os.getenv("LOG_LEVEL") or "INFO").upper())
+log_config.info("Log file %s", log_path.replace("\\", "/") if log_path else "not written (stdout only)")
+
+# Poll-failure trackers: each failed read and the recovery are logged.
+tracker_outage = log_setup.Outage(log_conn, "Tracker read")
+feed_outage = log_setup.Outage(log_conn, "Feed check")
 
 # Discord user allowed to run owner-only commands (e.g. /register_seed). If unset, the
 # bot falls back to the guild owner.
@@ -53,7 +77,7 @@ async def on_connect():
     global tracker_url, auth
     if bot.auto_sync_commands:
         await bot.sync_commands()
-    print(f'Logged in as {bot.user.name}')
+    log_conn.info("Logged in to Discord as %s", bot.user.name)
 
     # on_connect fires on EVERY gateway (re)connect; start the background loops exactly once.
     # Otherwise each reconnect spawns another copy of each loop -> duplicate DMs / channel
@@ -64,25 +88,25 @@ async def on_connect():
         return
     background_tasks_started = True
 
-    print("Starting user item tracker loop.")
+    log_start.info("Starting the tracked-items loop")
     bot.loop.create_task(check_tracked_items_loop())
 
-    print("Starting system item tracker loop.")
-    channel = bot.get_channel(int(discord_channel_id))
+    log_start.info("Starting the tracker loop")
+    channel = bot.get_channel(int(discord_channel_id)) if discord_channel_id else None
     if channel is None:
-        print(f"Channel with ID {discord_channel_id} not found.")
-        print("No Discord channel ID provided. System item tracker will only send messages to users tracking items.")
+        log_config.warning("Feed channel %s, so the tracker is read but nothing is posted to a channel",
+                           "not found" if discord_channel_id else "not set")
         bot.loop.create_task(no_dm_tracker(tracker_url, auth))
     else:
         bot.loop.create_task(check_for_item_changes(tracker_url, auth, discord_channel_id))
 
-        print("Starting hourly percentage update loop.")
+        log_start.info("Starting the hourly percentage loop")
         bot.loop.create_task(hourly_percentage_loop(discord_channel_id))
 
-    print("Starting go-mode notification loop.")
+    log_start.info("Starting the go-mode notification loop")
     bot.loop.create_task(check_go_mode_loop())
 
-    print("Starting unstuck alert loop.")
+    log_start.info("Starting the unstuck alert loop")
     bot.loop.create_task(check_unstuck_loop())
 
     # Build every slot of the registered seed now, so the first command doesn't wait on it.
@@ -94,12 +118,31 @@ async def on_disconnect():
     # Fires on every gateway disconnect. py-cord auto-reconnects (and resumes the session),
     # so this is informational, NOT a failure -- the old "failed to reconnect" wording was
     # misleading. A matching on_resumed/on_connect line confirms the reconnect.
-    print(f'Disconnected from the Discord gateway at {datetime.datetime.now()} (will auto-reconnect).')
+    log_conn.warning("Disconnected from the Discord gateway (will auto-reconnect)")
 
 
 @bot.event
 async def on_resumed():
-    print(f'Resumed the Discord gateway session at {datetime.datetime.now()}.')
+    log_conn.info("Resumed the Discord gateway session")
+
+
+@bot.event
+async def on_ready():
+    log_conn.info("Discord ready, in %s server(s)", len(bot.guilds))
+
+
+@bot.event
+async def on_application_command(ctx):
+    """One line per slash command used. Options named *password* are never written."""
+    options = []
+    for opt in (getattr(ctx, "selected_options", None) or []):
+        name = str(opt.get("name", ""))
+        if "password" in name.lower():
+            continue
+        options.append("attached file" if name == "seed_file" else str(opt.get("value")))
+    log_cmd.info("/%s by %s: %s", getattr(ctx.command, "qualified_name", "?"),
+                 getattr(ctx.author, "display_name", None) or getattr(ctx.author, "name", "?"),
+                 ", ".join(options) or "no options")
 
 
 @bot.event
@@ -108,10 +151,11 @@ async def on_application_command_error(ctx, error):
     # -- log one line instead of a full traceback. Everything else keeps the default traceback.
     original = getattr(error, "original", error)
     if isinstance(original, discord.NotFound) and getattr(original, "code", None) == 10062:
-        print(f"[interaction] command '{getattr(ctx.command, 'qualified_name', '?')}' "
-              f"expired before the bot could respond (10062); ignoring.")
+        log_cmd.warning("/%s expired before the bot could respond (10062), ignored",
+                        getattr(ctx.command, "qualified_name", "?"))
         return
-    traceback.print_exception(type(error), error, error.__traceback__)
+    log_error.error("/%s failed: %s", getattr(ctx.command, "qualified_name", "?"), original,
+                    exc_info=(type(error), error, error.__traceback__))
 
 
 # data_package.json is large (~1.5 MB) and the two autocompletes below fire on every
@@ -343,6 +387,7 @@ async def hint(ctx, slot_name: str, item: str, password: str = None):
         result = await hint_client.request_hint(address, canonical, password, item,
                                                 data_package=_load_data_package())
 
+    log_hints.info("Hint for %s, %s: %s", canonical, item, result.status)
     if result.status == "ok":
         body = "\n".join(result.lines) or "The server gave no answer."
         content = f"**/hint {canonical}: {item}**\n{body}"
@@ -375,6 +420,7 @@ async def get_server_data(ctx, server_address: str, slot_name: str, password: st
         try:
             await ap_connector.main(initial_response, server_address, slot_name, password)
         except Exception as e:
+            log_error.exception("Could not connect to the Archipelago server: %s", e)
             try:
                 await initial_response.edit_original_response(content=f"Failed to connect: {e}")
             except Exception:
@@ -419,6 +465,7 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
         try:
             await seed_file.save(zip_path)
         except Exception as e:
+            log_error.exception("Could not download the seed attachment: %s", e)
             await initial_response.edit_original_response(content=f"Couldn't download the attachment: {e}")
             return
     else:
@@ -437,6 +484,7 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
         try:
             registry = await gomode_bot.register_seed(zip_path, progress=say)
         except Exception as e:
+            log_error.exception("Seed registration failed: %s", e)
             # Mirror the success path's DM: a late failure (after the ephemeral token expired)
             # would otherwise be invisible, since say()'s edit silently no-ops.
             msg = f"Registration failed: {e}"
@@ -447,6 +495,10 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
                 pass
             return
         supported = registry['slot_count'] - registry['unsupported']
+        log_goal.info("Registered seed %s: %s slots, %s not supported", registry['seed'],
+                      registry['slot_count'], registry['unsupported'])
+        for slot in registry.get("unsupported_slots", []):
+            log_goal.info("%s (%s) is not supported: %s", slot['name'], slot['game'], str(slot['reason'])[:120])
         summary = (
             f"**Registered seed `{registry['seed']}`** (Archipelago {registry['version']}).\n"
             f"- {registry['slot_count']} slots analyzed\n"
@@ -1271,6 +1323,17 @@ async def send_items(ctx, assignment, initial_response):
     return message
 
 
+def _log_announced(diff):
+    """One line per item the feed announced, and one per goal."""
+    for slot_data in diff.values():
+        for slot_name, details in slot_data.items():
+            for item_name, count in (details.get("New Items") or {}).items():
+                log_setup.get("items").info("Announced %s%s for %s", item_name,
+                                            f" x{count}" if count != 1 else "", slot_name)
+            if "Goal Completed" in details:
+                log_goal.info("Announced goal complete for %s", slot_name)
+
+
 def format_diff_message(diff):
     lines = []
 
@@ -1339,8 +1402,9 @@ async def no_dm_tracker(tracker_url, auth):
         try:
             await asyncio.get_running_loop().run_in_executor(
                 None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
+            tracker_outage.ok()
         except Exception as e:
-            print(f"[tracker] scrape failed (will retry next cycle): {e}")
+            tracker_outage.failed(e)
         await asyncio.sleep(_next_poll_delay(interval, time.monotonic() - started,
                                              tracker_download.last_source))
 
@@ -1354,7 +1418,7 @@ async def _hide_filler(diff):
             return diff
         return gomode_bot.drop_filler(diff, item_flags, gomode_bot._load_items_received())
     except Exception as e:
-        print(f"[tracker] filler filter failed, posting everything: {e}")
+        log_error.exception("Filler filter failed, posting everything: %s", e)
         return diff
 
 
@@ -1363,11 +1427,11 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
     await bot.wait_until_ready()
     channel = bot.get_channel(int(channel_id))
     if channel is None:
-        print(f"Channel with ID {channel_id} not found.")
+        log_config.error("Feed channel not found, the item feed is off")
         return
 
     interval = _feed_poll_seconds()
-    print(f"[feed] reading the tracker every {interval:g}s")
+    log_feed.info("Reading the tracker every %gs", interval)
     quiet_cycles = 0
     while not bot.is_closed():
         started = time.monotonic()
@@ -1381,13 +1445,12 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
         try:
             diff = await asyncio.get_running_loop().run_in_executor(
                 None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
-            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            tracker_outage.ok()
             if diff:
                 diff = await _hide_filler(diff)
                 if not diff:
-                    print(f"Only filler items received at {current_time}")
+                    log_feed.info("Only filler items received, nothing posted")
             if diff:
-                print(f"Changes found at {current_time}")
                 message = format_diff_message(diff)
                 # Prepare to send the message in a code block.
                 # Adjust the maximum content length to account for the code block wrappers.
@@ -1396,14 +1459,16 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
                 chunks = chunk_text_by_line(message, max_content_length)
                 for chunk in chunks:
                     await channel.send(f"```ansi\n{chunk}\n```")
+                _log_announced(diff)
                 quiet_cycles = 0
             else:
                 # Log a quiet spell about once every 5 minutes, not on every read.
                 quiet_cycles += 1
                 if quiet_cycles % max(1, round(300 / interval)) == 1:
-                    print(f"No changes found at {current_time}")
+                    log_feed.info("No new items lately")
+            feed_outage.ok()
         except Exception as e:
-            print(f"[tracker] item-change check failed (will retry next cycle): {e}")
+            feed_outage.failed(e)
 
         # Keep the pinned unfound-hints message(s) current (None: no hint data this run).
         try:
@@ -1411,7 +1476,7 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
             if hints is not None:
                 await hints_pin.sync(channel, hints)
         except Exception as e:
-            print(f"[hints] pinned hints update failed (will retry next cycle): {e}")
+            log_error.exception("Pinned hints update failed, will retry next cycle: %s", e)
 
         # Wait out the rest of the interval before reading again (see _next_poll_delay).
         await asyncio.sleep(_next_poll_delay(interval, time.monotonic() - started,
@@ -1432,7 +1497,7 @@ def _load_percentage_state():
     except FileNotFoundError:
         return None
     except Exception as e:
-        print(f"[percentage] could not read {percentage_state_json}: {e}")
+        log_error.exception("Could not read %s: %s", os.path.basename(percentage_state_json), e)
         return None
     return state if isinstance(state, dict) else None
 
@@ -1449,7 +1514,7 @@ def _save_percentage_state(checked, total, percent_text):
         with open(percentage_state_json, "w") as f:
             json.dump(state, f, indent=4)
     except Exception as e:
-        print(f"[percentage] could not write {percentage_state_json}: {e}")
+        log_error.exception("Could not write %s: %s", os.path.basename(percentage_state_json), e)
 
 
 def _seconds_until_next_hour():
@@ -1465,7 +1530,7 @@ async def hourly_percentage_loop(channel_id):
     await bot.wait_until_ready()
     channel = bot.get_channel(int(channel_id))
     if channel is None:
-        print(f"Channel with ID {channel_id} not found; skipping hourly percentage updates.")
+        log_config.error("Feed channel not found, skipping hourly percentage updates")
         return
 
     while not bot.is_closed():
@@ -1475,13 +1540,13 @@ async def hourly_percentage_loop(channel_id):
         try:
             await _report_percentage_change(channel)
         except Exception as e:
-            print(f"[percentage] hourly update failed (will retry next hour): {e}")
+            log_error.exception("Hourly percentage update failed, will retry next hour: %s", e)
 
 
 async def _report_percentage_change(channel):
     completion = tracker_download.overall_completion()
     if completion is None:
-        print("[percentage] no parseable checks data yet; skipping this hour.")
+        log_feed.info("No parseable checks data yet, skipping this hour's percentage update")
         return
     checked, total = completion
     percent_text = f"{(checked / total) * 100:.2f}%"
@@ -1493,11 +1558,11 @@ async def _report_percentage_change(channel):
     # silently -- there is no "went from" to report yet.
     if not previous:
         _save_percentage_state(checked, total, percent_text)
-        print(f"[percentage] baseline recorded at {percent_text} ({checked}/{total}).")
+        log_feed.info("Completion baseline recorded at %s (%s of %s checks)", percent_text, checked, total)
         return
 
     if percent_text == previous:
-        print(f"[percentage] unchanged at {percent_text}; nothing to announce.")
+        log_feed.info("Completion unchanged at %s, nothing to announce", percent_text)
         return
 
     # Only persist after the message actually lands, so a failed send re-reports next hour
@@ -1507,7 +1572,7 @@ async def _report_percentage_change(channel):
         f"({checked:,}/{total:,} checks)"
     )
     _save_percentage_state(checked, total, percent_text)
-    print(f"[percentage] announced {previous} -> {percent_text} ({checked}/{total}).")
+    log_feed.info("Announced completion %s -> %s (%s of %s checks)", previous, percent_text, checked, total)
 
 
 # Slash command to DM the user a list of all items for their tracked slots.
@@ -1644,7 +1709,7 @@ async def check_tracked_items_loop():
         try:
             await _run_tracked_items_check()
         except Exception as e:
-            print(f"[tracked-items] check failed (will retry next cycle): {e}")
+            log_error.exception("Tracked-items check failed, will retry next cycle: %s", e)
         await asyncio.sleep(10)
 
 
@@ -1658,7 +1723,7 @@ async def _run_tracked_items_check():
         with open(items_received_json, "r") as f:
             items_received = json.load(f)
     except Exception as e:
-        print(f"Error loading {items_received_json}: {e}")
+        log_error.exception("Could not read %s: %s", os.path.basename(items_received_json), e)
         return
 
     # Load listeners.json (the tracking assignments)
@@ -1738,9 +1803,9 @@ async def _run_tracked_items_check():
                 if user_obj:
                     await user_obj.send("\n".join(user_messages))
             except discord.Forbidden:
-                print(f"Could not DM user {user_id}. They might have DMs disabled.")
+                log_error.warning("Could not DM Discord user %s about a tracked item (DMs disabled)", user_id)
             except Exception as e:
-                print(f"[tracked-items] could not DM user {user_id}: {e}")
+                log_error.exception("Could not DM Discord user %s about a tracked item: %s", user_id, e)
 
     # If any updates were made, save the updated listeners data back to file
     if any_update:
@@ -1756,7 +1821,7 @@ async def check_unstuck_loop():
         try:
             await _run_unstuck_alerts()
         except Exception as e:  # never let one bad cycle kill the loop
-            print(f"[unstuck] alert check error: {e}")
+            log_error.exception("Unstuck alert check failed: %s", e)
         await asyncio.sleep(120)
 
 
@@ -1808,16 +1873,17 @@ async def _run_unstuck_alerts():
                 user = await bot.fetch_user(int(user_id))
                 if user:
                     await user.send(msg)
+                    log_goal.info("Told %s that %s has checks in logic again", user.name, name)
             except discord.Forbidden:
-                print(f"[unstuck] could not DM {user_id} for {name} (DMs disabled)")
+                log_error.warning("Could not DM Discord user %s the unstuck alert for %s (DMs disabled)", user_id, name)
             except Exception as e:
-                print(f"[unstuck] DM error for {user_id}/{name}: {e}")
+                log_error.exception("Could not DM Discord user %s the unstuck alert for %s: %s", user_id, name, e)
 
     if changed:
         try:
             gomode_bot.save_unstuck_state(seed, state)
         except Exception as e:
-            print(f"[unstuck] could not save state: {e}")
+            log_error.exception("Could not save the unstuck state: %s", e)
 
 
 async def check_go_mode_loop():
@@ -1829,7 +1895,7 @@ async def check_go_mode_loop():
         try:
             await _run_go_mode_notifications()
         except Exception as e:  # never let one bad cycle kill the loop
-            print(f"[go-mode] notification check error: {e}")
+            log_error.exception("Go-mode notification check failed: %s", e)
         await asyncio.sleep(120)
 
 
@@ -1911,22 +1977,23 @@ async def _run_go_mode_notifications():
                 user = await bot.fetch_user(int(author_id))
                 if user:
                     await user.send(msg)
+                    log_goal.info("Told %s that %s reached go mode", user.name, sn)
                     # Mark notified ONLY after the DM actually sends, so a closed-DM/transient
                     # failure is retried next cycle instead of being silently lost.
                     notified.add(tok(author_id, sn))
                     _go_mode_dm_sent.add((seed, author_id, sn))
                     changed = True
             except discord.Forbidden:
-                print(f"[go-mode] could not DM {author_id} for {sn} (DMs disabled)")
+                log_error.warning("Could not DM Discord user %s that %s reached go mode (DMs disabled)", author_id, sn)
             except Exception as e:
-                print(f"[go-mode] DM error for {author_id}/{sn}: {e}")
+                log_error.exception("Could not DM Discord user %s that %s reached go mode: %s", author_id, sn, e)
 
     if changed:
         try:
             gomode_bot.save_notified(seed, notified)
         except Exception as e:
             # Persistence failed, but the in-process guard already prevents re-DMing this run.
-            print(f"[go-mode] could not persist notified state: {e}")
+            log_error.exception("Could not save the go-mode notified state: %s", e)
 
 
 if __name__ == "__main__":

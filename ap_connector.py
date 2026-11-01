@@ -9,6 +9,12 @@ from time import sleep
 from discord.ext import tasks
 import websockets
 
+import log_setup
+
+log = log_setup.get('conn')
+log_items = log_setup.get('items')
+log_error = log_setup.get('error')
+
 is_websocket_connected = False
 auto_reconnect = False
 packet_queue = asyncio.Queue()
@@ -59,7 +65,7 @@ async def disconnect(websocket):
     await websocket.close()
     global is_websocket_connected, auto_reconnect
     is_websocket_connected = False
-    print("Disconnected from the server.")
+    log.info("Disconnected from the Archipelago server")
     auto_reconnect = False
 
 async def check_connection(websocket, slot_name, password):
@@ -68,10 +74,10 @@ async def check_connection(websocket, slot_name, password):
         await asyncio.sleep(10)
         if not is_websocket_connected:
             if auto_reconnect:
-                print("Attempting to reconnect...")
+                log.info("Not connected, sending the connect request again")
                 await send_connect_packet(websocket, slot_name, password)
             else:
-                print("Auto-reconnect is disabled. Exiting.")
+                log.info("Reconnecting is off, leaving the connection check")
                 break
 
 
@@ -82,7 +88,7 @@ async def send_hello(websocket):
         'cmd': 'Say',
         'text': "Don't worry, I'm just grabbing some data."
     }]
-    print("Sending hello message")
+    log.debug("Sending hello message")
     await send(websocket, payload)
 
 
@@ -90,7 +96,7 @@ async def send_hello(websocket):
 async def send(websocket, payload):
     # Encode the payload
     payload = encode(payload)
-    print(f"Sending: {payload}")
+    log.debug("Sending a packet to the Archipelago server")
     await websocket.send(payload)
 
 
@@ -187,11 +193,11 @@ async def handle_messages(discord_ack, websocket):
         # Don't clobber the success/refusal message when we closed on purpose.
         if not intentional_close:
             await discord_ack.edit_original_response(content="Connection was closed.")
-        print("Connection was closed.")
+        log.info("Archipelago connection closed")
 
 async def add_packet_to_queue(discord_ack, websocket, packet):
     await packet_queue.put((discord_ack, websocket, packet))
-    print(f"Added a packet to the queue. Queue size: {packet_queue.qsize()}")
+    log.debug("Packet queued, queue size %s", packet_queue.qsize())
 
 
 # Read the provided packet and process it by type
@@ -204,8 +210,7 @@ async def read_response():
             discord_ack, websocket, msg = await packet_queue.get()
             if msg.get("cmd") == "Connected":
                 connected_received = True
-                print(msg)
-                print("Connected to the server")
+                log.info("Connected to the Archipelago server, %s slots in the room", len(msg.get("slot_info", {})))
 
                 slot_info = msg.get("slot_info", {})
                 slot_mapping = {}
@@ -230,30 +235,27 @@ async def read_response():
 
 
             elif msg.get("cmd") == "RoomInfo":
-                print("Got room info packet")
-                print(msg)
+                log.debug("Got room info packet")
                 games_in_server = msg.get("games", {})
                 room_info_received = True
                 # We request one data package per game, so expect one response each.
                 expected_data_packages = len(games_in_server)
                 for game in games_in_server:
-                    print(f"Getting data package for {game}")
+                    log.info("Asking for the data package of %s", game)
                     await get_data_package(websocket, game)
 
             elif msg.get("cmd") == "DataPackage":
-                print("Got a data package")
+                log.info("Got a data package (%s of %s)", received_data_packages + 1, expected_data_packages)
                 received_data_packages += 1
 
                 main.data_package_mapping = await process_data_package(msg["data"])
 
             elif msg.get("cmd") == "PrintJSON":
                 if msg.get("type") == "ItemSend":
-                    print("Someone got an item, processing information.")
-                    print(msg)
 
                     data_array = msg.get("data")
                     if not data_array:
-                        print("No data array found in the message.")
+                        log_error.warning("Item message from the server had no data, skipped")
                         return
 
                     # Extract player IDs from the data array.
@@ -267,7 +269,7 @@ async def read_response():
                         sender_slot_id = player_ids[0]
                         receiver_slot_id = player_ids[0]
                     else:
-                        print("Unexpected number of player IDs found:", player_ids)
+                        log_error.warning("Item message had an unexpected set of players %s, skipped", player_ids)
                         return
 
                     sender_name = main.slot_mapping.get(sender_slot_id, {}).get("slot_name", "Unknown")
@@ -316,7 +318,10 @@ async def read_response():
                     else:
                         location_name = "Unknown"
 
-                    print(f"Sender: {sender_name}, Receiver: {receiver_name}, Item: {item_name}, Location: {location_name}, Flag: {item_flag}")
+                    log_items.info("Received %s for %s from %s (%s)",
+                             item_name if item_name != "Unknown" else f"unknown item {item_id[0] if item_id else '?'}",
+                             receiver_name, sender_name,
+                             location_name if location_name != "Unknown" else f"unknown location {location_id[0] if location_id else '?'}")
 
                     # Store the packet data
                     os.makedirs("data", exist_ok=True)
@@ -361,7 +366,7 @@ async def read_response():
                     reason = ", ".join(str(e) for e in errors)
                 else:
                     reason = str(errors)
-                print("Connection refused. Reason:", reason)
+                log.error("Archipelago server refused the connection: %s", reason)
                 intentional_close = True
                 await discord_ack.edit_original_response(
                     content=f"The server refused the connection: {reason}. Check the slot name and password."
@@ -369,15 +374,14 @@ async def read_response():
                 await disconnect(websocket)
                 is_websocket_connected = False
             elif msg.get("cmd") == "Bounced":
-                print("Boing!")
+                log.debug("Bounced packet")
             else:
-                print(f"Received unknown packet: {msg}")
+                log.debug("Ignored a %s packet", msg.get("cmd"))
 
             # Once we have the slot info and every game's data package, we're done.
             await finish_data_collection_if_complete(discord_ack, websocket)
-            print(f"Queue size: {packet_queue.qsize()}")
     except Exception as e:
-        print(f"An error occurred while processing the packet: {e}")
+        log_error.exception("Could not process a packet from the Archipelago server: %s", e)
         await discord_ack.edit_original_response(content=f"An error occurred while processing the packet: {e}")
 
 
@@ -437,7 +441,7 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
             uri = f"{scheme}://{cleaned}"
             try:
                 async with websockets.connect(uri) as websocket:
-                    print(f"Connected to {uri}")
+                    log.info("Connected to %s, slot %s", uri, slot_name)
                     schemes = [scheme]  # pin the working scheme for any reconnects
                     is_websocket_connected = True
                     # Send initial connection payload
@@ -455,16 +459,16 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
             except websockets.InvalidMessage:
                 # Handshake wasn't valid HTTP -- usually a scheme mismatch, e.g. a
                 # plaintext ws:// handshake against a TLS-only endpoint. Try the next.
-                print(f"{scheme}:// handshake failed; trying the next scheme.")
+                log.warning("%s:// handshake failed, trying the next scheme", scheme)
                 connection_error = "handshake failed"
                 continue
             except websockets.ConnectionClosed:
-                print("Websocket connection closed.")
+                log.info("Archipelago connection closed")
                 is_websocket_connected = False
                 connection_error = None
                 break
             except Exception as e:
-                print(f"Failed to connect via {scheme}://: {e}")
+                log.error("Failed to connect via %s://: %s", scheme, e)
                 connection_error = e
                 continue
 
@@ -481,5 +485,5 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
         if not auto_reconnect:
             break
 
-        print("Attempting to reconnect in 5 seconds...")
+        log.info("Reconnecting in 5 seconds")
         await asyncio.sleep(5)
