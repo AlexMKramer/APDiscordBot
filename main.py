@@ -212,6 +212,8 @@ async def slot_name_autocomplete(ctx: discord.AutocompleteContext):
 
     os.makedirs("data", exist_ok=True)
     slot_info_json = os.path.join("data", "slot_info.json")
+    if not os.path.exists(slot_info_json):
+        return []  # /get_server_data hasn't been run yet.
     with open(slot_info_json, "r") as f:
         slot_info = json.load(f)
     slot_names = sorted([info.get("slot_name") for info in slot_info.values()])
@@ -270,6 +272,8 @@ async def slot_name_for_assigned_game_autocomplete(ctx: discord.AutocompleteCont
     assignments = listeners_data[author_id]
     # Get the game name from the command options; it must be provided on your slash command.
     game_name = ctx.options.get("game_name")
+    if not game_name:
+        return []  # No game chosen yet, so nothing to suggest.
 
     # Filter assignments to only those matching the specified game (case-insensitive)
     filtered_assignments = [
@@ -1216,7 +1220,7 @@ async def get_new_items_for_slot(ctx, slot_name: str):
             underline_start = "[4;2m"
             underline_end = "[0m"
 
-            header = f"{underline_start}Items received for {slot_name}:{underline_end}"
+            header = f"{underline_start}Items received for {assigned_slot}:{underline_end}"
 
             diff_message_lines.append(header)
             for item_name, diff_amount in diff_items.items():
