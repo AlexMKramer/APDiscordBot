@@ -90,14 +90,57 @@ def _describe_source(slot_data_opts: dict, spoiler_opts: dict) -> str:
     return "+".join(parts)
 
 
-def _build_multiworld(world_type, options: dict, player_name: str, passthrough, rng=None):
+def _make_option(option_cls, value, world_type=None, player_name: str = ""):
+    """An option instance holding `value`, the way Generate.py makes one: `from_any`, then
+    `verify`, which is where a location set's group names ("Hidden" in Dark Souls III's default
+    Excluded Locations) become the locations in them.
+
+    A Choice whose values are strings (Bomberman The Second Attack's Character: "17e.bin") has a
+    default `from_any` can't read back, because it treats a string as an option *name*. Such a
+    value is already the stored form, so build the option from it directly."""
+    try:
+        option = option_cls.from_any(value)
+    except Exception:  # noqa: BLE001 -- fall back to the stored form
+        option = option_cls(value)
+    if world_type is not None:
+        try:
+            from BaseClasses import PlandoOptions
+            option.verify(world_type, player_name, PlandoOptions.none)
+        except Exception:  # noqa: BLE001 -- an option that won't verify keeps its raw value
+            pass
+    return option
+
+
+def _settle(state) -> None:
+    """Re-run the region search until it stops finding regions. One pass is order-dependent:
+    an entrance whose rule asks "can I reach this location?" (Bomberman The Second Attack's
+    shops and Noah) is judged before the region it depends on is reached, and stays blocked until
+    the next pass. Archipelago's own fill passes again after every item it places, so the real
+    logic is the fixpoint; a state collected with prevent_sweep needs the passes run for it."""
+    for player in list(state.reachable_regions):
+        for _ in range(100):
+            before = len(state.reachable_regions[player])
+            state.update_reachable_regions(player)
+            if len(state.reachable_regions[player]) == before:
+                break
+
+
+def _build_multiworld(world_type, options: dict, player_name: str, passthrough, rng=None,
+                      fake: bool = True, pre_fill: bool = False):
     """One no-fill generation of a single slot, the way Universal Tracker's TMain does it:
     flagged as fake generation, and with the seed's slot data handed back to the world when
     it supports UT regeneration (`re_gen_passthrough`).
 
     `rng` is (generation seed, slot, players). With it the world gets the same RNG it had in
     the real generation, so its random choices (which weapons are progression, shuffled
-    entrances, rolled counts) come out the same even for worlds without UT support."""
+    entrances, rolled counts) come out the same even for worlds without UT support.
+
+    `fake=False` leaves out the fake-generation flag, for worlds that build a different item pool
+    when they see it (Lego Star Wars makes a reduced pool for trackers): the world then runs the
+    code the real generation ran.
+
+    `pre_fill=True` also runs the world's own pre_fill, for worlds that decide there which of their
+    locations exist (Paper Mario turns its unshuffled vanilla locations into events there)."""
     from argparse import Namespace
     from random import Random
     from BaseClasses import CollectionState, MultiWorld
@@ -105,7 +148,8 @@ def _build_multiworld(world_type, options: dict, player_name: str, passthrough, 
     from worlds.generic.Rules import exclusion_rules
 
     multiworld = MultiWorld(1)
-    multiworld.generation_is_fake = True
+    if fake:
+        multiworld.generation_is_fake = True
     if passthrough is not None:
         multiworld.re_gen_passthrough = {world_type.game: passthrough}
     # UT's "off" mode: every entrance gets connected. We have no found-entrance data, and
@@ -116,8 +160,13 @@ def _build_multiworld(world_type, options: dict, player_name: str, passthrough, 
     multiworld.player_name = {1: player_name or "Player1"}
     args = Namespace()
     for key, option in world_type.options_dataclass.type_hints.items():
-        setattr(args, key, {1: option.from_any(options.get(key, option.default))})
+        setattr(args, key, {1: _make_option(option, options.get(key, option.default), world_type, player_name)})
     multiworld.set_options(args)
+    if rng and rng[2] > 1:
+        # Some worlds only apply their real logic in a multiworld (Noita's holy mountain locks
+        # are skipped when `multiworld.players` is 1), so report the seed's real player count.
+        # Set after set_options, which sizes the per-player tables for the one slot built here.
+        multiworld.players = rng[2]
     if rng:
         # Real generation seeds the multiworld RNG with the seed, then each world, in player
         # order, takes Random(multiworld.random.getrandbits(64)). Replay the slot's own draw,
@@ -130,14 +179,30 @@ def _build_multiworld(world_type, options: dict, player_name: str, passthrough, 
         for _ in range(max(players, slot) - 1):
             multiworld.random.getrandbits(64)
     multiworld.state = CollectionState(multiworld)
-    for step in BUILD_STEPS:
-        if not hasattr(World, step):
-            continue
-        call_all(multiworld, step)
-        if step == "set_rules":
-            exclude = getattr(multiworld.worlds[1].options, "exclude_locations", None)
-            if exclude is not None:
-                exclusion_rules(multiworld, 1, exclude.value)
+    plain_can_beat_game = multiworld.can_beat_game
+
+    def can_beat_game(starting_state=None, locations=None):
+        if starting_state is not None:
+            _settle(starting_state)
+        return plain_can_beat_game(starting_state, locations)
+
+    multiworld.can_beat_game = can_beat_game
+    try:
+        for step in BUILD_STEPS:
+            if not hasattr(World, step):
+                continue
+            call_all(multiworld, step)
+            if step == "set_rules":
+                exclude = getattr(multiworld.worlds[1].options, "exclude_locations", None)
+                if exclude is not None:
+                    exclusion_rules(multiworld, 1, exclude.value)
+        if pre_fill:
+            # Fill walks players 1..players, and only slot 1 is built here.
+            multiworld.players = 1
+            call_all(multiworld, "pre_fill")
+    finally:
+        # Only the build sees the real player count; the analysis walks players 1..players.
+        multiworld.players = 1
     return multiworld
 
 
@@ -197,7 +262,7 @@ def _make_item(world, name: str, templates: dict):
         return item
 
 
-def _finish(multiworld, world_type, precollected):
+def _finish(multiworld, world_type, precollected, pre_filled: bool = False):
     """Turn a rebuilt multiworld into a PreparedSlot, or return (None, reason) if it fails a
     guardrail. Strips start items (the tracker inventory supplies them) and collects the
     universe of progression items the player can ever hold."""
@@ -242,6 +307,10 @@ def _finish(multiworld, world_type, precollected):
             pass
     universe = [item for item in multiworld.itempool if item.advancement]
     universe += [item for item in start_items if item.advancement]
+    if pre_filled:
+        # The world placed its own items while pre-filling; they are still received in play.
+        universe += [loc.item for loc in multiworld.get_locations(player)
+                     if loc.item and loc.item.advancement and loc.item.code is not None]
 
     def beats_with(items):
         state = CollectionState(multiworld)
@@ -254,10 +323,22 @@ def _finish(multiworld, world_type, precollected):
     # so if the pool alone falls short, add the world's pre-fill items the way AP's fill counts
     # them. (Only then: other worlds' pre-fill lists repeat items already in the pool.)
     if not beats_with(universe):
+        # Real items the world locked into its own locations while building (Diddy Kong Racing's
+        # door-unlock items): the player still receives them, so they are part of "everything".
+        universe += [loc.item for loc in multiworld.get_locations(player)
+                     if loc.item and loc.item.advancement and loc.item.code is not None]
+    if not beats_with(universe):
         try:
             universe += [item for item in world.get_pre_fill_items() if item.advancement]
         except Exception:  # noqa: BLE001 -- a world whose pre-fill list needs pre_fill state
             pass
+        if not beats_with(universe) and _run_pre_fill(multiworld, world):
+            # Worlds that lock their own items in pre_fill (Diddy Kong Racing's Wizpig amulet
+            # pieces): run it and count what it placed, as the real generation did.
+            universe = [item for item in multiworld.itempool if item.advancement]
+            universe += [item for item in start_items if item.advancement]
+            universe += [loc.item for loc in multiworld.get_locations(player)
+                         if loc.item and loc.item.advancement and loc.item.code is not None]
         if not beats_with(universe):
             # Still short: our reconstruction is missing something. Don't guess.
             return None, ("Goal is unreachable even with every progression item -- the logic "
@@ -265,6 +346,16 @@ def _finish(multiworld, world_type, precollected):
 
     return PreparedSlot(multiworld=multiworld, world_type=world_type, universe=universe,
                         prog_names={item.name for item in universe}, templates=templates), ""
+
+
+def _run_pre_fill(multiworld, world) -> bool:
+    """Run the world's own pre_fill step. Only used when the goal can't be reached without it,
+    so a world whose pre_fill needs more than a solo no-fill build just stays unreachable."""
+    try:
+        world.pre_fill()
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def _same_datapackage(world_type, seed_package: dict) -> bool:
@@ -370,6 +461,11 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
     if rng:
         candidates += [("seed", rng, {}), ("seed+ut", rng, slot_data or {})]
     candidates.append(("ut", None, slot_data or {}))
+    if rng:
+        # Last resort, tried only when none of the above matched the seed's record.
+        candidates.append(("seed(real)", rng, {}))
+        candidates.append(("seed+pre_fill", rng, {}))
+        candidates.append(("seed(real)+pre_fill", rng, {}))
     checkable = bool(expected_locations or expected_prog)
 
     best = None      # (mismatch, PreparedSlot, label, source)
@@ -377,8 +473,16 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
     for label, cand_rng, cand_slot_data in candidates:
         for opts, source in attempts:
             try:
-                multiworld, how = _regen_like_ut(world_type, opts, name, cand_slot_data, cand_rng)
-                prepared, why = _finish(multiworld, world_type, precollected)
+                pre_filled = label.endswith("+pre_fill")
+                if label.startswith("seed(real)"):
+                    multiworld, how = _build_multiworld(world_type, opts, name, None, cand_rng,
+                                                        fake=False, pre_fill=pre_filled), "none"
+                elif pre_filled:
+                    multiworld, how = _build_multiworld(world_type, opts, name, None, cand_rng,
+                                                        pre_fill=True), "none"
+                else:
+                    multiworld, how = _regen_like_ut(world_type, opts, name, cand_slot_data, cand_rng)
+                prepared, why = _finish(multiworld, world_type, precollected, pre_filled)
             except Exception as exc:  # noqa: BLE001 -- try the next, less-faithful option set
                 failures.append(f"{label}: {type(exc).__name__}: {exc}")
                 continue
@@ -403,10 +507,17 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
 
     mismatch, prepared, tag, source = best
     if mismatch and source.startswith("defaults"):
-        # The real settings didn't build, and a default-settings world is a different game.
+        # A default-settings world is a different game from the one the slot is playing.
         result.status = "unsupported"
-        result.reason = ("The slot's settings didn't rebuild, and a default-settings rebuild doesn't "
-                         f"match the seed ({failures[0] if failures else 'no detail'}).")
+        if source == "defaults":
+            # Nothing was recovered: the spoiler log had no settings block for the slot and the
+            # game's slot data carries no options (single-player seeds write no settings block).
+            result.reason = ("The seed doesn't record this slot's settings (none in the spoiler log or "
+                             "the game's slot data), and the game's default settings give a different "
+                             f"world than the seed's ({mismatch} differences in locations or key items).")
+        else:
+            result.reason = ("The slot's settings didn't rebuild, and a default-settings rebuild doesn't "
+                             f"match the seed ({failures[0] if failures else 'no detail'}).")
         return None, result
     # Some worlds settle which copies are progression after generate_basic. The seed says which
     # names were progression for this slot; count those too, as UT does with the server's flags.
@@ -459,6 +570,7 @@ def inventory_state(prepared: PreparedSlot, inventory: dict):
             item = copy.copy(template)
             item.location = None
             state.collect(item, prevent_sweep=True)
+    _settle(state)
     return state, unknown
 
 

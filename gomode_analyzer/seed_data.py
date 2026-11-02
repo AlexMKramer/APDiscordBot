@@ -80,6 +80,17 @@ def _read_multidata(zip_path: str):
     return decoded, spoiler
 
 
+def _as_json_like(value):
+    """The multidata keeps a slot's slot data with tuples where the world wrote lists. A tracker
+    receives it as JSON, so worlds' `interpret_slot_data` get lists (and call list methods on
+    them, e.g. TCG Card Shop Simulator's `.extend`); hand them the same shape."""
+    if isinstance(value, (list, tuple)):
+        return [_as_json_like(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _as_json_like(v) for k, v in value.items()}
+    return value
+
+
 def _names(id_flags: dict, package: dict) -> dict:
     """{item_id: flags} -> {item_name: flags}, using the game's datapackage from the seed."""
     id_to_name = {item_id: name for name, item_id in package.get("item_name_to_id", {}).items()}
@@ -122,7 +133,7 @@ def load_seed(zip_path: str) -> SeedData:
             options=dict(options) if isinstance(options, dict) else {},
             precollected=list(precollected.get(sid, []) or []),
             spoiler_settings=blocks.get(sid, {}).get("settings", {}),
-            slot_data=dict(sd) if isinstance(sd, dict) else {},
+            slot_data=_as_json_like(sd) if isinstance(sd, dict) else {},
             datapackage=datapackage.get(game) or {},
             location_ids=location_ids.get(sid, set()),
             prog_item_ids=prog_item_ids.get(sid, Counter()),

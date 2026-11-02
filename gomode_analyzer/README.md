@@ -163,6 +163,10 @@ go-mode answers. `engine.prepare_slot` tries these, most faithful first:
    the slot's `slot_data` handed back through `re_gen_passthrough` (via `interpret_slot_data`
    where the world has one). This covers settings the spoiler doesn't carry.
 3. **`ut`** — UT's regeneration alone, for seeds without a spoiler (race seeds).
+4. **`seed(real)`**, **`seed+pre_fill`**, **`seed(real)+pre_fill`** — tried only when none of the above matches the seed's record.
+   `seed(real)` leaves out `generation_is_fake`, for worlds that build a smaller item pool when they see a tracker
+   (Lego Star Wars, Old School Runescape, Metroid Prime). `+pre_fill` also runs the world's own `pre_fill`, for worlds
+   that decide there which locations exist (Paper Mario, Kingdom Hearts 2, ARK).
 
 Each rebuild is checked against what the multidata recorded for the slot: its real location
 IDs and the progression items it owns. The first exact match is used; if none match, the
@@ -179,6 +183,14 @@ actually do in game:
 - Items the world locks onto its own locations (Refunct's `Goal Location` on the goal
   platform) count once reachable, so "go mode" means "you have everything, go finish" rather
   than "you already touched the goal".
+
+**Other details of the rebuild:** the build is told the seed's real player count (Noita skips its holy mountain locks
+in a one-player multiworld); options are verified the way `Generate.py` does (Dark Souls III's default excluded
+locations are group names); a Choice with string values is built from its stored value (Bomberman The Second Attack);
+the region search is repeated until nothing new is reached, because entrance rules that ask whether a location is
+reachable are order-dependent in one pass; slot data tuples become lists, as a tracker receives them. A world that
+draws from the shared multiworld RNG (Dead Rising, Ratchet & Clank 2, Simon Tatham's Puzzles) can't be replayed from one
+slot, and the mismatch count shows it.
 
 **Start inventory:** the tracker's inventory already includes it (the web tracker adds the
 multidata's precollected items), so the rebuild strips every real start item and lets the
