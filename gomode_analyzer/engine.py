@@ -685,7 +685,13 @@ def analyze_prepared(prepared: PreparedSlot, result: SlotResult, inventory: dict
     if fast:
         # Notification fast-path: the caller only needs the go-mode boolean.
         return result
-    remaining = _remaining_pool(prepared.universe, inventory)
+    # Goal events can't be sent by anyone: the world locks the item (e.g. "Victory") into one of its own
+    # locations, and holding it alone completes the goal. Logic already sweeps that location, so the item
+    # stays in the universe and the goal is judged as before, but it is never listed as needed. Event items
+    # with no id are left out the same way.
+    locked = {id(loc.item) for loc in multiworld.get_locations(1) if loc.item is not None and loc.locked}
+    remaining = _remaining_pool([it for it in prepared.universe if not _is_goal_event(multiworld, it, locked)],
+                                inventory)
 
     if len(remaining) > MAX_MINIMIZATION_ITEMS:
         # Safety valve: don't attempt an unbounded minimization. Report the whole
@@ -720,6 +726,18 @@ def analyze_prepared(prepared: PreparedSlot, result: SlotResult, inventory: dict
             req["unverified_tree"] = tree
         result.requirements = req
     return result
+
+
+def _is_goal_event(multiworld, item, locked: set) -> bool:
+    """An item with no id, or one the world locked into a location of its own that completes the goal by itself."""
+    if item.code is None:
+        return True
+    if id(item) not in locked:
+        return False
+    from BaseClasses import CollectionState
+    state = CollectionState(multiworld)
+    state.collect(item, prevent_sweep=True)
+    return bool(multiworld.completion_condition[item.player](state))
 
 
 def _remaining_pool(prog_pool, inventory) -> list:
