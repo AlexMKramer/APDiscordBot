@@ -68,6 +68,10 @@ def render_message(msg, slot_names, slot_games, maps):
                     text = name if name else f"#{text}"
         except (ValueError, TypeError):
             pass
+        if kind == "hint_status" and msg.get("found") is False and text.strip().lower() == "(found)":
+            # The server can word a hint "(found)" from its status while the hint itself is not found yet;
+            # the found flag is what the tracker's hint table shows, so go by that.
+            text = "(not found)"
         pieces.append(text)
     return "".join(pieces).strip(), {g for g in missing if g}
 
