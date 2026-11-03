@@ -1,3 +1,4 @@
+import functools
 import time
 
 import discord
@@ -6,6 +7,7 @@ from discord import option
 import asyncio
 import dotenv
 import os
+import runs
 import datetime
 import fnmatch
 import ap_connector
@@ -72,9 +74,158 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 bot.auto_sync_commands = True
 
 
+async def _migrate_single_run_if_needed():
+    """First start after the multi-run update: the old .env run becomes the first linked run,
+    named after its feed channel when the bot can read it ("Run 1" otherwise). No-op afterwards."""
+    if os.path.exists(runs.registry_path()) or not (discord_channel_id and tracker_url):
+        return
+    channel_name = None
+    try:
+        channel = bot.get_channel(int(discord_channel_id)) or await bot.fetch_channel(int(discord_channel_id))
+        channel_name = getattr(channel, "name", None)
+    except Exception as e:  # noqa: BLE001  - not found / no access: fall back to the default name
+        log_config.warning("Could not read the feed channel's name (%s); naming the run %r", e, runs.FALLBACK_NAME)
+    try:
+        run = runs.migrate_single_run(discord_channel_id, tracker_url, channel_name,
+                                      os.getenv("AP_SERVER_ADDRESS"))
+    except Exception:
+        log_error.exception("Moving the existing run into its own folder failed; nothing was lost; "
+                            "carrying on with the old layout and it will be tried again on the next start")
+        raise
+    if run:
+        log_start.info("Linked the existing run as %r (data/runs/%s); the old files are kept in data/%s",
+                       run.name, run.id, runs.BACKUP_NAME)
+
+
+def _rk(run):
+    """Keyword arguments that hand a run on to a per-run function. Nothing for the single-run setup
+    (no registry), so it calls the functions exactly as it always did."""
+    return {"run": run} if run is not None else {}
+
+
+def _run_key(run) -> str:
+    return run.id if run is not None else ""
+
+
+def _dm_prefix(run) -> str:
+    """"[<run name>] " in front of a DM, but only while more than one run is active: a bot with
+    one run sends exactly the messages it always did."""
+    if run is None or len(runs.active_runs()) < 2:
+        return ""
+    return f"[{run.name}] "
+
+
+def resolve_run(ctx):
+    """(run, ok) for a command or autocomplete. In a linked channel (or a thread under it) that is
+    the channel's run. Anywhere else it is the only active run, or (None, True) with no runs at all,
+    so a bot with one run behaves as it always did; with two or more runs it is (None, False)."""
+    run = runs.run_for_ctx(ctx)
+    if run is not None:
+        return run, True
+    active = runs.active_runs()
+    if len(active) >= 2:
+        return None, False
+    return (active[0] if active else None), True
+
+
+def _linked_channels_text() -> str:
+    return ", ".join(f"<#{r.channel_id}>" if r.channel_id else (r.channel_name or r.name)
+                     for r in runs.active_runs())
+
+
+async def _gate(ctx):
+    """(run, ok): ok is False after answering "use this in a run's channel" (only ever with 2+ runs)."""
+    run, ok = resolve_run(ctx)
+    if not ok:
+        await ctx.respond(f"Use this in a run's channel: {_linked_channels_text()}", ephemeral=True)
+    return run, ok
+
+
+# Each run's own poll-failure trackers, so one run's outage does not hide or reset the other's.
+_run_outages = {}
+
+
+def _outages(run):
+    if run is None:
+        return tracker_outage, feed_outage
+    if run.id not in _run_outages:
+        _run_outages[run.id] = (log_setup.Outage(log_conn, f"Tracker read ({run.name})"),
+                                log_setup.Outage(log_conn, f"Feed check ({run.name})"))
+    return _run_outages[run.id]
+
+
+# The background tasks of each running run: run id ("" for the single-run setup) -> [asyncio tasks].
+_run_tasks = {}
+
+
+def run_is_running(run=None) -> bool:
+    return any(not t.done() for t in _run_tasks.get(_run_key(run), ()))
+
+
+def start_run(run=None):
+    """Start one run's background loops: the item feed (with the pinned hints), the hourly
+    percentage, tracked-item DMs, go-mode DMs and unstuck alerts, and the go-mode analyzer when
+    the run has a registered seed. Does nothing when they already run. run=None starts the
+    single-run setup from the .env settings (no registry)."""
+    key = _run_key(run)
+    if run_is_running(run):
+        return _run_tasks[key]
+    url = run.tracker_url if run is not None else tracker_url
+    channel_id = run.channel_id if run is not None else discord_channel_id
+    label = f" for {run.name!r}" if run is not None else ""
+    started = []
+
+    def spawn(coro):
+        started.append(bot.loop.create_task(coro))
+
+    log_start.info("Starting the tracked-items loop%s", label)
+    spawn(check_tracked_items_loop(**_rk(run)))
+
+    log_start.info("Starting the tracker loop%s", label)
+    channel = bot.get_channel(int(channel_id)) if channel_id else None
+    if not url:
+        log_config.warning("No tracker URL%s, so there is no item feed", label)
+    elif channel is None:
+        log_config.warning("Feed channel %s%s, so the tracker is read but nothing is posted to a channel",
+                           "not found" if channel_id else "not set", label)
+        spawn(no_dm_tracker(url, auth, **_rk(run)))
+    else:
+        spawn(check_for_item_changes(url, auth, channel_id, **_rk(run)))
+
+        log_start.info("Starting the hourly percentage loop%s", label)
+        spawn(hourly_percentage_loop(channel_id, **_rk(run)))
+
+    log_start.info("Starting the go-mode notification loop%s", label)
+    spawn(check_go_mode_loop(**_rk(run)))
+
+    log_start.info("Starting the unstuck alert loop%s", label)
+    spawn(check_unstuck_loop(**_rk(run)))
+
+    # Build every slot of the registered seed now, so the first command doesn't wait on it
+    # (a run with no registered seed starts nothing).
+    spawn(gomode_bot.warm_worker(**_rk(run)))
+    _run_tasks[key] = started
+    return started
+
+
+async def stop_run(run=None):
+    """Stop one run's background loops (and its go-mode analyzer). Other runs keep going."""
+    tasks_ = _run_tasks.pop(_run_key(run), [])
+    for task in tasks_:
+        task.cancel()
+    await asyncio.gather(*tasks_, return_exceptions=True)
+    if run is not None:
+        await gomode_bot.stop_worker(run)
+    log_start.info("Stopped the background loops%s", f" for {run.name!r}" if run is not None else "")
+
+
 @bot.event
 async def on_connect():
     global tracker_url, auth
+    try:
+        await _migrate_single_run_if_needed()
+    except Exception:  # noqa: BLE001  - already logged; carry on with the .env settings and try again next start
+        pass
     if bot.auto_sync_commands:
         await bot.sync_commands()
     log_conn.info("Logged in to Discord as %s", bot.user.name)
@@ -88,29 +239,13 @@ async def on_connect():
         return
     background_tasks_started = True
 
-    log_start.info("Starting the tracked-items loop")
-    bot.loop.create_task(check_tracked_items_loop())
-
-    log_start.info("Starting the tracker loop")
-    channel = bot.get_channel(int(discord_channel_id)) if discord_channel_id else None
-    if channel is None:
-        log_config.warning("Feed channel %s, so the tracker is read but nothing is posted to a channel",
-                           "not found" if discord_channel_id else "not set")
-        bot.loop.create_task(no_dm_tracker(tracker_url, auth))
-    else:
-        bot.loop.create_task(check_for_item_changes(tracker_url, auth, discord_channel_id))
-
-        log_start.info("Starting the hourly percentage loop")
-        bot.loop.create_task(hourly_percentage_loop(discord_channel_id))
-
-    log_start.info("Starting the go-mode notification loop")
-    bot.loop.create_task(check_go_mode_loop())
-
-    log_start.info("Starting the unstuck alert loop")
-    bot.loop.create_task(check_unstuck_loop())
-
-    # Build every slot of the registered seed now, so the first command doesn't wait on it.
-    bot.loop.create_task(gomode_bot.warm_worker())
+    linked = runs.active_runs()
+    if linked:
+        for run in linked:
+            start_run(run)
+    elif not os.path.exists(runs.registry_path()):
+        start_run(None)   # no registry: the single run from .env
+    # (a registry with every run unlinked starts nothing until /link_run)
 
 
 @bot.event
@@ -209,9 +344,11 @@ async def items_autocomplete(ctx: discord.AutocompleteContext):
 
 
 async def slot_name_autocomplete(ctx: discord.AutocompleteContext):
-
+    run, ok = resolve_run(ctx)
+    if not ok:
+        return []
     os.makedirs("data", exist_ok=True)
-    slot_info_json = os.path.join("data", "slot_info.json")
+    slot_info_json = runs.run_path("slot_info.json", run)
     if not os.path.exists(slot_info_json):
         return []  # /get_server_data hasn't been run yet.
     with open(slot_info_json, "r") as f:
@@ -221,9 +358,12 @@ async def slot_name_autocomplete(ctx: discord.AutocompleteContext):
 
 
 async def slot_name_for_assigned_slot_autocomplete(ctx: discord.AutocompleteContext):
+    run, ok = resolve_run(ctx)
+    if not ok:
+        return []
     author_id = str(ctx.interaction.user.id)
     os.makedirs("data", exist_ok=True)
-    listeners_file_json = os.path.join("data", "listeners.json")
+    listeners_file_json = runs.run_path("listeners.json", run)
     with open(listeners_file_json, "r") as f:
         try:
             listeners_data = json.load(f)
@@ -239,10 +379,13 @@ async def slot_name_for_assigned_slot_autocomplete(ctx: discord.AutocompleteCont
 
 
 async def slot_name_for_game_autocomplete(ctx: discord.AutocompleteContext):
+    run, ok = resolve_run(ctx)
+    if not ok:
+        return []
     game_name = ctx.options.get("game_name")
 
     os.makedirs("data", exist_ok=True)
-    slot_info_json = os.path.join("data", "slot_info.json")
+    slot_info_json = runs.run_path("slot_info.json", run)
     with open(slot_info_json, "r") as f:
         slot_info = json.load(f)
 
@@ -251,11 +394,14 @@ async def slot_name_for_game_autocomplete(ctx: discord.AutocompleteContext):
 
 
 async def slot_name_for_assigned_game_autocomplete(ctx: discord.AutocompleteContext):
+    run, ok = resolve_run(ctx)
+    if not ok:
+        return []
     # Get the user's ID
     author_id = str(ctx.interaction.user.id)
     # Ensure the data directory exists
     os.makedirs("data", exist_ok=True)
-    listeners_file_json = os.path.join("data", "listeners.json")
+    listeners_file_json = runs.run_path("listeners.json", run)
 
     # Load the listeners file
     try:
@@ -293,34 +439,48 @@ async def slot_name_for_assigned_game_autocomplete(ctx: discord.AutocompleteCont
 # ---- /hint -------------------------------------------------------------------------------
 # The Archipelago server address for hints: AP_SERVER_ADDRESS in the environment, else the
 # address last given to /get_server_data (remembered in data/server_address.txt).
-_SERVER_ADDRESS_FILE = os.path.join("data", "server_address.txt")
 _hint_locks = {}
 
 
-def _remember_server_address(address):
+def _remember_server_address(address, run=None):
+    """Keep the address for /hint: in the run's folder and, for a linked run, in the registry."""
     try:
         os.makedirs("data", exist_ok=True)
-        with open(_SERVER_ADDRESS_FILE, "w", encoding="utf-8") as f:
+        with open(runs.run_path("server_address.txt", run), "w", encoding="utf-8") as f:
             f.write(address.strip())
     except OSError:
         pass
+    if run is not None:
+        try:
+            registry = runs.load_runs()
+            if run.id in registry:
+                registry[run.id].server_address = address.strip()
+                runs.save_runs(registry)
+            run.server_address = address.strip()
+        except OSError:
+            pass
 
 
-def _ap_server_address():
+def _ap_server_address(run=None):
+    """The server address of this run. AP_SERVER_ADDRESS from .env only counts while there is one
+    run (it cannot be the address of two); then the address last given to /get_server_data for
+    this run, then the one the run was linked with."""
+    run = run or runs.default_run()
     env = os.getenv("AP_SERVER_ADDRESS")
-    if env and env.strip():
+    if env and env.strip() and (run is None or len(runs.active_runs()) < 2):
         return env.strip()
     try:
-        with open(_SERVER_ADDRESS_FILE, encoding="utf-8") as f:
-            return f.read().strip()
+        with open(runs.run_path("server_address.txt", run), encoding="utf-8") as f:
+            remembered = f.read().strip()
     except OSError:
-        return ""
+        remembered = ""
+    return remembered or (run.server_address.strip() if run is not None else "")
 
 
-def _slot_game(slot_name):
+def _slot_game(slot_name, run=None):
     """(canonical slot name, game) from slot_info.json, matched case-insensitively; (None, None) if unknown."""
     try:
-        with open(os.path.join("data", "slot_info.json"), "r") as f:
+        with open(runs.run_path("slot_info.json", run), "r") as f:
             slot_info = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None, None
@@ -330,12 +490,12 @@ def _slot_game(slot_name):
     return None, None
 
 
-def _can_hint_slot(ctx, canonical_slot):
+def _can_hint_slot(ctx, canonical_slot, run=None):
     """Hinting spends the slot's hint points: only the bot owner or a user who assigned that slot may."""
     if is_owner(ctx):
         return True
     try:
-        with open(os.path.join("data", "listeners.json"), "r") as f:
+        with open(runs.run_path("listeners.json", run), "r") as f:
             mine = json.load(f).get(str(ctx.author.id), [])
     except (OSError, json.JSONDecodeError):
         return False
@@ -343,7 +503,10 @@ def _can_hint_slot(ctx, canonical_slot):
 
 
 async def hint_item_autocomplete(ctx: discord.AutocompleteContext):
-    _, game = _slot_game(ctx.options.get("slot_name"))
+    run, ok = resolve_run(ctx)
+    if not ok:
+        return []
+    _, game = _slot_game(ctx.options.get("slot_name"), run)
     if not game:
         return []
     for entry in _load_data_package():
@@ -361,10 +524,13 @@ async def hint_item_autocomplete(ctx: discord.AutocompleteContext):
 @option("item", description="The item to get a hint for.", autocomplete=hint_item_autocomplete, required=True)
 @option("password", description="The slot's password, if it has one. Not stored.", required=False)
 async def hint(ctx, slot_name: str, item: str, password: str = None):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
     initial_response = await ctx.respond("Asking the server for a hint...", ephemeral=True)
     item = " ".join((item or "").split())
 
-    canonical, _game = _slot_game(slot_name)
+    canonical, _game = _slot_game(slot_name, run)
     if not canonical:
         await initial_response.edit_original_response(
             content=f"{slot_name} not found. Check spelling, or run /get_server_data first.")
@@ -372,18 +538,18 @@ async def hint(ctx, slot_name: str, item: str, password: str = None):
     if not item:
         await initial_response.edit_original_response(content="Enter the item you want a hint for.")
         return
-    if not _can_hint_slot(ctx, canonical):
+    if not _can_hint_slot(ctx, canonical, run):
         await initial_response.edit_original_response(
             content=f"You can only get hints for slots you assigned to yourself with /assign_slot. "
                     f"Run /assign_slot {canonical} first.")
         return
-    address = _ap_server_address()
+    address = _ap_server_address(run)
     if not address:
         await initial_response.edit_original_response(
             content="I don't know the server address yet. Run /get_server_data first.")
         return
 
-    lock = _hint_locks.setdefault(canonical.lower(), asyncio.Lock())
+    lock = _hint_locks.setdefault((_run_key(run), canonical.lower()), asyncio.Lock())
     if lock.locked():
         await initial_response.edit_original_response(content=f"A hint for {canonical} is already in progress. Try again in a moment.")
         return
@@ -413,8 +579,11 @@ async def hint(ctx, slot_name: str, item: str, password: str = None):
 @option("slot_name", description="Enter the bot's slot name.", required = True)
 @option("password", description="Enter the server password.", required = False)
 async def get_server_data(ctx, server_address: str, slot_name: str, password: str = None):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
     initial_response = await ctx.respond("Connecting to server...")
-    _remember_server_address(server_address)
+    _remember_server_address(server_address, run)
 
     # ap_connector.main runs the websocket session, which stays open while connected.
     # Launch it in the background instead of awaiting it here -- awaiting would block
@@ -422,7 +591,7 @@ async def get_server_data(ctx, server_address: str, slot_name: str, password: st
     # report "Connected to the server" or any error.
     async def run_connection():
         try:
-            await ap_connector.main(initial_response, server_address, slot_name, password)
+            await ap_connector.main(initial_response, server_address, slot_name, password, **_rk(run))
         except Exception as e:
             log_error.exception("Could not connect to the Archipelago server: %s", e)
             try:
@@ -439,6 +608,9 @@ async def get_server_data(ctx, server_address: str, slot_name: str, password: st
 async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: str = None):
     if not is_owner(ctx):
         await ctx.respond("Only the server owner can register a seed.", ephemeral=True)
+        return
+    run, ok = await _gate(ctx)
+    if not ok:
         return
 
     ok, why = gomode_bot.is_configured()
@@ -484,9 +656,9 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
         except Exception:
             pass  # interaction token may have expired on a long precompute; DM below is the fallback
 
-    async def run():
+    async def do_register():
         try:
-            registry = await gomode_bot.register_seed(zip_path, progress=say)
+            registry = await gomode_bot.register_seed(zip_path, progress=say, **_rk(run))
         except Exception as e:
             log_error.exception("Seed registration failed: %s", e)
             # Mirror the success path's DM: a late failure (after the ephemeral token expired)
@@ -494,7 +666,7 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
             msg = f"Registration failed: {e}"
             await say(msg)
             try:
-                await ctx.author.send(msg)
+                await ctx.author.send(_dm_prefix(run) + msg)
             except discord.Forbidden:
                 pass
             return
@@ -518,16 +690,136 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
         # The precompute can run long enough to expire the ephemeral token; DM the owner so the
         # result is never lost.
         try:
-            await ctx.author.send(summary)
+            await ctx.author.send(_dm_prefix(run) + summary)
         except discord.Forbidden:
             pass
 
-    bot.loop.create_task(run())
+    bot.loop.create_task(do_register())
 
 
-def _load_listeners() -> dict:
+# ---- linking runs ------------------------------------------------------------------------------
+
+def _same_url(a: str, b: str) -> bool:
+    return (a or "").strip().rstrip("/").lower() == (b or "").strip().rstrip("/").lower()
+
+
+def _command_channel(ctx):
+    """(channel id, channel name) of the channel a command was used in; a thread counts as its parent."""
+    channel = getattr(ctx, "channel", None)
+    cid = getattr(channel, "parent_id", None) or getattr(ctx, "channel_id", None) or getattr(channel, "id", None)
+    parent = getattr(channel, "parent", None)
+    name = getattr(parent, "name", None) or getattr(channel, "name", None) or ""
+    return (str(cid) if cid is not None else ""), name
+
+
+@bot.slash_command(description="(Owner) Link this channel to an Archipelago run, so the bot tracks it here.")
+@option("name", description="A short name for the run.", required=True)
+@option("tracker_url", description="The run's tracker page, e.g. https://archipelago.gg/tracker/<id>.", required=True)
+@option("server_address", description="The Archipelago server address and port, if you know it.", required=False)
+async def link_run(ctx, name: str, tracker_url: str, server_address: str = None):
+    if not is_owner(ctx):
+        await ctx.respond("Only the server owner can link a run.", ephemeral=True)
+        return
+    name, url = (name or "").strip(), (tracker_url or "").strip()
+    address = (server_address or "").strip()
+    if not name:
+        await ctx.respond("Give the run a name.", ephemeral=True)
+        return
+    if not url.lower().startswith(("http://", "https://")):
+        await ctx.respond("The tracker URL has to start with http:// or https://.", ephemeral=True)
+        return
+    channel_id, channel_name = _command_channel(ctx)
+    if not channel_id:
+        await ctx.respond("Use this in the channel the run's feed should go to.", ephemeral=True)
+        return
+
+    registry = runs.load_runs()
+    for other in registry.values():
+        if not other.active:
+            continue
+        if other.channel_id == channel_id:
+            await ctx.respond(f"This channel is already linked to the run **{other.name}**. "
+                              f"Use /unlink_run here first, or link the run in another channel.", ephemeral=True)
+            return
+        if _same_url(other.tracker_url, url):
+            await ctx.respond(f"That tracker is already linked to **{other.name}** in <#{other.channel_id}>.",
+                              ephemeral=True)
+            return
+        if other.name.lower() == name.lower():
+            await ctx.respond(f"There is already a run called **{other.name}**. Pick another name.", ephemeral=True)
+            return
+
+    earlier = next((r for r in registry.values() if not r.active and _same_url(r.tracker_url, url)), None)
+    guild = getattr(ctx, "guild", None)
+    if earlier is not None:   # linked before and unlinked: bring it back with all its data
+        run = earlier
+        run.name, run.active = name, True
+        run.channel_id, run.channel_name = channel_id, channel_name
+        run.guild_id = str(getattr(guild, "id", "") or run.guild_id)
+        if address:
+            run.server_address = address
+    else:
+        run = runs.Run(id=runs.make_run_id(name, taken=set(registry)), name=name, channel_id=channel_id,
+                       channel_name=channel_name, guild_id=str(getattr(guild, "id", "") or ""),
+                       tracker_url=url, server_address=address, created=time.strftime("%Y-%m-%d %H:%M:%S"))
+    os.makedirs(run.dir, exist_ok=True)
+    registry[run.id] = run
+    runs.save_runs(registry)
+    if address:
+        _remember_server_address(address, run)
+
+    await stop_run(None)      # the no-registry setup's loops, if they were running, give way to the run's own
+    start_run(run)
+    log_start.info("Linked run %r to channel %s (data/runs/%s)", run.name, channel_id, run.id)
+    await ctx.respond(
+        f"{'Restored' if earlier is not None else 'Linked'} **{run.name}** to this channel. Its feed will post here.\n"
+        f"Next: /get_server_data and /register_seed in this channel, then players use /assign_slot.",
+        ephemeral=True)
+
+
+@bot.slash_command(description="(Owner) Stop tracking the run linked to this channel. Its data is kept.")
+async def unlink_run(ctx):
+    if not is_owner(ctx):
+        await ctx.respond("Only the server owner can unlink a run.", ephemeral=True)
+        return
+    run = runs.run_for_ctx(ctx)
+    if run is None:
+        await ctx.respond("This channel is not linked to a run.", ephemeral=True)
+        return
+    await stop_run(run)
+    registry = runs.load_runs()
+    if run.id in registry:
+        registry[run.id].active = False
+        runs.save_runs(registry)
+    log_start.info("Unlinked run %r from its channel; the data in data/runs/%s is kept", run.name, run.id)
+    await ctx.respond(f"Unlinked **{run.name}**. It stops posting and tracking; its data is kept, and "
+                      f"/link_run with the same tracker URL brings it back.", ephemeral=True)
+
+
+@bot.slash_command(description="(Owner) List the runs this bot knows about.")
+async def list_runs(ctx):
+    if not is_owner(ctx):
+        await ctx.respond("Only the server owner can list the runs.", ephemeral=True)
+        return
+    registry = runs.load_runs()
+    if not registry:
+        await ctx.respond("No runs are linked. Use /link_run in the channel for a run.", ephemeral=True)
+        return
+    lines = []
+    for run in registry.values():
+        seed = "yes" if gomode_bot.load_registry(run=run) is not None else "no"
+        lines.append(f"**{run.name}** ({'active' if run.active else 'unlinked'})\n"
+                     f"  channel: {f'<#{run.channel_id}>' if run.channel_id else 'none'}\n"
+                     f"  tracker: {run.tracker_url or 'none'}\n"
+                     f"  server: {run.server_address or 'not set'}\n"
+                     f"  seed registered: {seed}")
+    await ctx.respond("\n".join(lines)[:1900], ephemeral=True)
+
+
+
+def _load_listeners(run=None) -> dict:
     try:
-        with open(os.path.join("data", "listeners.json"), "r") as f:
+        with open(runs.run_path("listeners.json", run), "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
@@ -561,10 +853,11 @@ def _go_mode_overview_line(name: str, st: dict) -> str:
     return f"• {name}{tag} — (couldn't determine right now)"
 
 
-async def _send_go_mode_detail(ctx, initial_response, slot_name: str):
+async def _send_go_mode_detail(ctx, initial_response, slot_name: str, run=None):
     """Detailed 'what do I still need' for one slot, against current inventory."""
-    inventory = gomode_bot.current_inventory(slot_name)
-    res = await gomode_bot.analyze_slot_live(slot_name, inventory)
+    rk = _rk(run)
+    inventory = gomode_bot.current_inventory(slot_name, **rk)
+    res = await gomode_bot.analyze_slot_live(slot_name, inventory, **rk)
     if res is None:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
@@ -595,7 +888,7 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str):
     # (catch HTTPException, not just Forbidden, so a rate-limit mid-stream can't escape).
     try:
         for chunk in chunk_text_by_line(body, 1900):
-            await ctx.author.send(chunk)
+            await ctx.author.send(_dm_prefix(run) + chunk)
         await initial_response.edit_original_response(
             content=f"{header}\nThe list is long — I've sent it to you in a DM.")
     except discord.Forbidden:
@@ -610,15 +903,19 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str):
 @option("slot_name", description="A specific slot (leave blank to see all your slots).",
         autocomplete=slot_name_for_assigned_slot_autocomplete, required=False)
 async def items_to_go_mode(ctx, slot_name: str = None):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    rk = _rk(run)
     initial_response = await ctx.respond("Checking go-mode status...", ephemeral=True)
 
-    if gomode_bot.load_registry() is None:
+    if gomode_bot.load_registry(**rk) is None:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
         return
 
     author_id = str(ctx.author.id)
-    assignments = _load_listeners().get(author_id, [])
+    assignments = _load_listeners(run).get(author_id, [])
     my_slots = [a.get("slot_name") for a in assignments if a.get("slot_name")]
     if not my_slots:
         await initial_response.edit_original_response(
@@ -631,14 +928,14 @@ async def items_to_go_mode(ctx, slot_name: str = None):
             await initial_response.edit_original_response(
                 content=f"You don't have **{slot_name}** assigned to you.")
             return
-        await _send_go_mode_detail(ctx, initial_response, slot_name)
+        await _send_go_mode_detail(ctx, initial_response, slot_name, run)
         return
     if len(my_slots) == 1:
-        await _send_go_mode_detail(ctx, initial_response, my_slots[0])
+        await _send_go_mode_detail(ctx, initial_response, my_slots[0], run)
         return
 
     # Otherwise an at-a-glance overview of every slot you hold.
-    status = await gomode_bot.go_mode_status(my_slots)
+    status = await gomode_bot.go_mode_status(my_slots, **rk)
     lines = ["**Go-mode status for your slots:**"]
     lines += [_go_mode_overview_line(name, status.get(name, {})) for name in sorted(my_slots)]
     lines.append("")
@@ -651,7 +948,7 @@ async def items_to_go_mode(ctx, slot_name: str = None):
     # than silently truncating it.
     try:
         for chunk in chunk_text_by_line(content, 1900):
-            await ctx.author.send(chunk)
+            await ctx.author.send(_dm_prefix(run) + chunk)
         await initial_response.edit_original_response(
             content="Your list is long — I've sent the full status to you in a DM.")
     except discord.Forbidden:
@@ -664,11 +961,14 @@ async def items_to_go_mode(ctx, slot_name: str = None):
 
 async def slot_names_autocomplete(ctx: discord.AutocompleteContext):
     """Completes the last name of a comma-separated list, keeping the ones already typed."""
+    run, ok = resolve_run(ctx)
+    if not ok:
+        return []
     typed, _, current = (ctx.value or "").rpartition(",")
     prefix = f"{typed}, " if typed else ""
     current = current.strip().lower()
     try:
-        with open(os.path.join("data", "slot_info.json"), "r") as f:
+        with open(runs.run_path("slot_info.json", run), "r") as f:
             slot_info = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
@@ -676,12 +976,12 @@ async def slot_names_autocomplete(ctx: discord.AutocompleteContext):
     return [prefix + name for name in names if name.lower().startswith(current)][:25]
 
 
-def _resolve_slot_names(slot_names, cache: dict, author_id: str):
+def _resolve_slot_names(slot_names, cache: dict, author_id: str, run=None):
     """Comma-separated slot names or wildcards -> (names, unmatched patterns, problem message).
     Blank means the caller's assigned slots. `problem` is set when nothing usable matched."""
     seed_names = [s.get("name", "") for s in cache.get("slots", {}).values()]
     if not slot_names or not slot_names.strip():
-        assignments = _load_listeners().get(author_id, [])
+        assignments = _load_listeners(run).get(author_id, [])
         names = [a.get("slot_name") for a in assignments if a.get("slot_name")]
         if not names:
             return [], [], "You have no assigned slots. Name some slots, or use /assign_slot first."
@@ -702,9 +1002,9 @@ def _resolve_slot_names(slot_names, cache: dict, author_id: str):
     return names, unmatched, None
 
 
-def _without_goal_completed(names):
+def _without_goal_completed(names, run=None):
     """The slots that have not reached their goal yet."""
-    items_received = gomode_bot._load_items_received()
+    items_received = gomode_bot._load_items_received(**_rk(run))
     return [n for n in names if not gomode_bot.goal_completed(items_received, n)]
 
 
@@ -738,30 +1038,34 @@ def _checks_line(name: str, st: dict) -> str:
 @option("slot_names", description="Slot names or wildcards like Alex_*, comma-separated. Leave blank for your assigned slots.",
         autocomplete=slot_names_autocomplete, required=False)
 async def checks_in_logic(ctx, slot_names: str = None):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    rk = _rk(run)
     initial_response = await ctx.respond("Counting checks in logic...", ephemeral=True)
 
-    cache = gomode_bot.load_cache()
-    if gomode_bot.load_registry() is None or not cache:
+    cache = gomode_bot.load_cache(**rk)
+    if gomode_bot.load_registry(**rk) is None or not cache:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
         return
-    names, unmatched, problem = _resolve_slot_names(slot_names, cache, str(ctx.author.id))
+    names, unmatched, problem = _resolve_slot_names(slot_names, cache, str(ctx.author.id), run)
     if problem:
         await initial_response.edit_original_response(content=problem)
         return
 
-    names = _without_goal_completed(names)
+    names = _without_goal_completed(names, run)
     if not names:
         await initial_response.edit_original_response(content="Every slot you asked about has reached its goal.")
         return
-    status = await gomode_bot.checks_in_logic(names)
+    status = await gomode_bot.checks_in_logic(names, **rk)
     names = _unsupported_last(names, status)
     lines = ["**Checks in logic:**"] + [_checks_line(n, status.get(n, {})) for n in names]
     if unmatched:
         lines.append(f"No slots matched: {', '.join(unmatched)}")
     try:
         for chunk in chunk_text_by_line("\n".join(lines), 1900):
-            await ctx.author.send(chunk)
+            await ctx.author.send(_dm_prefix(run) + chunk)
         await initial_response.edit_original_response(
             content=f"Sent you a DM with checks in logic for {len(names)} slot{'s' if len(names) != 1 else ''}.")
     except discord.Forbidden:
@@ -775,10 +1079,14 @@ async def checks_in_logic(ctx, slot_names: str = None):
 @bot.slash_command(description="Get a DM listing the checks in logic for a slot that haven't been done yet.")
 @option("slot_name", description="The slot to list checks for.", autocomplete=slot_name_autocomplete, required=True)
 async def which_checks_in_logic(ctx, slot_name: str):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    rk = _rk(run)
     initial_response = await ctx.respond("Finding checks in logic...", ephemeral=True)
 
-    cache = gomode_bot.load_cache()
-    if gomode_bot.load_registry() is None or not cache:
+    cache = gomode_bot.load_cache(**rk)
+    if gomode_bot.load_registry(**rk) is None or not cache:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
         return
@@ -789,10 +1097,10 @@ async def which_checks_in_logic(ctx, slot_name: str):
             content=f"**{slot_name}** isn't a slot in the registered seed.")
         return
 
-    if gomode_bot.goal_completed(gomode_bot._load_items_received(), name):
+    if gomode_bot.goal_completed(gomode_bot._load_items_received(**rk), name):
         await initial_response.edit_original_response(content=f"**{name}** has reached its goal.")
         return
-    st = (await gomode_bot.checks_in_logic([name], list_names=True)).get(name, {})
+    st = (await gomode_bot.checks_in_logic([name], list_names=True, **rk)).get(name, {})
     message = _checks_line(name, st)
     to_do = st.get("to_do") or []
     if to_do:
@@ -801,7 +1109,7 @@ async def which_checks_in_logic(ctx, slot_name: str):
         message += "\n  Nothing in logic is left to do right now."
     try:
         for chunk in chunk_text_by_line(message, 1900):
-            await ctx.author.send(chunk)
+            await ctx.author.send(_dm_prefix(run) + chunk)
         await initial_response.edit_original_response(
             content=f"Sent you a DM with the checks in logic for **{name}**.")
     except discord.Forbidden:
@@ -815,10 +1123,14 @@ async def which_checks_in_logic(ctx, slot_name: str):
 @bot.slash_command(description="Get a DM ranking the missing items that would open the most checks for a slot.")
 @option("slot_name", description="The slot to rank items for.", autocomplete=slot_name_autocomplete, required=True)
 async def most_useful_items(ctx, slot_name: str):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    rk = _rk(run)
     initial_response = await ctx.respond("Ranking items...", ephemeral=True)
 
-    cache = gomode_bot.load_cache()
-    if gomode_bot.load_registry() is None or not cache:
+    cache = gomode_bot.load_cache(**rk)
+    if gomode_bot.load_registry(**rk) is None or not cache:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
         return
@@ -829,7 +1141,7 @@ async def most_useful_items(ctx, slot_name: str):
             content=f"**{slot_name}** isn't a slot in the registered seed.")
         return
 
-    st = await gomode_bot.most_useful_items(name, top=10)
+    st = await gomode_bot.most_useful_items(name, top=10, **rk)
     game = st.get("game") or ""
     tag = f" ({game})" if game else ""
     if st.get("status") != "ok":
@@ -843,7 +1155,7 @@ async def most_useful_items(ctx, slot_name: str):
         message = "\n".join(lines)
     try:
         for chunk in chunk_text_by_line(message, 1900):
-            await ctx.author.send(chunk)
+            await ctx.author.send(_dm_prefix(run) + chunk)
         await initial_response.edit_original_response(
             content=f"Sent you a DM with the most useful items for **{name}**.")
     except discord.Forbidden:
@@ -860,9 +1172,13 @@ async def most_useful_items(ctx, slot_name: str):
 @option("slot_names", description="Slot names or wildcards like Alex_*, comma-separated. Leave blank for your assigned slots.",
         autocomplete=slot_names_autocomplete, required=False)
 async def unstuck_alerts(ctx, action: str, slot_names: str = None):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    rk = _rk(run)
     initial_response = await ctx.respond("Updating your unstuck alerts...", ephemeral=True)
     author_id = str(ctx.author.id)
-    subs = gomode_bot.load_unstuck_subscriptions()
+    subs = gomode_bot.load_unstuck_subscriptions(**rk)
     mine = set(subs.get(author_id, []))
 
     if action == "list":
@@ -871,12 +1187,12 @@ async def unstuck_alerts(ctx, action: str, slot_names: str = None):
         await initial_response.edit_original_response(content=content[:1900])
         return
 
-    cache = gomode_bot.load_cache()
-    if gomode_bot.load_registry() is None or not cache:
+    cache = gomode_bot.load_cache(**rk)
+    if gomode_bot.load_registry(**rk) is None or not cache:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
         return
-    names, unmatched, problem = _resolve_slot_names(slot_names, cache, author_id)
+    names, unmatched, problem = _resolve_slot_names(slot_names, cache, author_id, run)
     if problem:
         await initial_response.edit_original_response(content=problem)
         return
@@ -891,19 +1207,22 @@ async def unstuck_alerts(ctx, action: str, slot_names: str = None):
     if unmatched:
         content += f"\nNo slots matched: {', '.join(unmatched)}"
     subs[author_id] = sorted(mine)
-    gomode_bot.save_unstuck_subscriptions(subs)
+    gomode_bot.save_unstuck_subscriptions(subs, **rk)
     await initial_response.edit_original_response(content=content[:1900])
 
 
 @bot.slash_command(description="Assign your discord account to a slot name. Use * as a wildcard to assign several at once.")
 @option("slot_name", description="A slot name, or a wildcard like Alex_* to assign every matching slot.", autocomplete = slot_name_autocomplete, required=True)
 async def assign_slot(ctx, slot_name: str):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
     initial_response = await ctx.respond("Assigning slot name...", ephemeral=True)
 
     pattern = slot_name.strip()
 
     os.makedirs("data", exist_ok=True)
-    slot_info_json = os.path.join("data", "slot_info.json")
+    slot_info_json = runs.run_path("slot_info.json", run)
     try:
         with open(slot_info_json, "r") as f:
             slot_info = json.load(f)
@@ -936,7 +1255,7 @@ async def assign_slot(ctx, slot_name: str):
 
     author_id = str(ctx.author.id)
 
-    listeners_file_json = os.path.join("data", "listeners.json")
+    listeners_file_json = runs.run_path("listeners.json", run)
 
     # Load existing listeners data or initialize an empty dictionary
     if os.path.exists(listeners_file_json):
@@ -1003,6 +1322,9 @@ async def assign_slot(ctx, slot_name: str):
 @bot.slash_command(description="Get a DM with a list of all items received for a slot.")
 @option("slot_name", description="Enter your slot name.", autocomplete = slot_name_autocomplete, required=True)
 async def get_items_for_slot(ctx, slot_name: str):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
     # Send an initial ephemeral response to indicate processing.
     initial_response = await ctx.respond(content="Getting items...", ephemeral=True)
 
@@ -1013,7 +1335,7 @@ async def get_items_for_slot(ctx, slot_name: str):
     }
 
     # Get the message built by send_items for this assignment.
-    message = await send_items(ctx, assignment, initial_response)
+    message = await send_items(ctx, assignment, initial_response, run)
 
     # Use plain code block formatting (without "ansi").
     wrapper_length = len("``ansi`\n") + len("\n```")
@@ -1025,7 +1347,7 @@ async def get_items_for_slot(ctx, slot_name: str):
     try:
         # DM each chunk to the user.
         for chunk in chunks:
-            await ctx.author.send(f"```ansi\n{chunk}\n```")
+            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
         await initial_response.edit_original_response(
             content="I've sent you a DM with a list of items for the specified slot."
         )
@@ -1037,8 +1359,11 @@ async def get_items_for_slot(ctx, slot_name: str):
 
 @bot.slash_command(description="Get a DM with only the new items received for your assigned games.")
 async def get_all_new_items(ctx):
-    listeners_file = os.path.join("data", "listeners.json")
-    items_received_file = os.path.join("data", "items_received.json")
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    listeners_file = runs.run_path("listeners.json", run)
+    items_received_file = runs.run_path("items_received.json", run)
 
     # Load listeners data.
     if not os.path.exists(listeners_file):
@@ -1138,7 +1463,7 @@ async def get_all_new_items(ctx):
     await ctx.respond("I've sent you a DM with your new items for all your assigned games.", ephemeral=True)
     try:
         for chunk in chunks:
-            await ctx.author.send(f"```ansi\n{chunk}\n```")
+            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
     except discord.Forbidden:
         await ctx.respond("I couldn't send you a DM. Please check your DM settings.", ephemeral=True)
 
@@ -1146,8 +1471,11 @@ async def get_all_new_items(ctx):
 @bot.slash_command(description="Get a DM with new items received for a specified slot.")
 @option("slot_name", description="Enter your slot name.", autocomplete = slot_name_for_assigned_slot_autocomplete, required=True)
 async def get_new_items_for_slot(ctx, slot_name: str):
-    listeners_file = os.path.join("data", "listeners.json")
-    items_received_file = os.path.join("data", "items_received.json")
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    listeners_file = runs.run_path("listeners.json", run)
+    items_received_file = runs.run_path("items_received.json", run)
 
     # Load listeners data.
     if not os.path.exists(listeners_file):
@@ -1247,7 +1575,7 @@ async def get_new_items_for_slot(ctx, slot_name: str):
     await ctx.respond("I've sent you a DM with your new items for the specified slot.", ephemeral=True)
     try:
         for chunk in chunks:
-            await ctx.author.send(f"```ansi\n{chunk}\n```")
+            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
     except discord.Forbidden:
         await ctx.respond("I couldn't send you a DM. Please check your DM settings.", ephemeral=True)
 
@@ -1277,7 +1605,7 @@ def chunk_text_by_line(content, max_length):
 
 # Updated send_items: searches for the assignment's slot in the new items_received.json format,
 # and builds a plain-text message listing the items and their amounts.
-async def send_items(ctx, assignment, initial_response):
+async def send_items(ctx, assignment, initial_response, run=None):
     # Extract the slot name and game from the assignment dictionary
     slot_name = assignment.get("slot_name", "Unknown")
     game_name = assignment.get("game", "Unknown")
@@ -1285,7 +1613,7 @@ async def send_items(ctx, assignment, initial_response):
     # Load the items_received.json file
     try:
         os.makedirs("data", exist_ok=True)
-        items_received_json = os.path.join("data", "items_received.json")
+        items_received_json = runs.run_path("items_received.json", run)
         with open(items_received_json, "r") as f:
             items_received = json.load(f)
 
@@ -1394,8 +1722,9 @@ def _next_poll_delay(interval, elapsed, source="api"):
     return max(min(1.0, interval / 2), interval - elapsed)
 
 
-async def no_dm_tracker(tracker_url, auth):
+async def no_dm_tracker(tracker_url, auth, run=None):
     interval = _feed_poll_seconds()
+    tracker_outage, _ = _outages(run)
     while True:
         started = time.monotonic()
         # get_all_tracker_received_items is BLOCKING (synchronous requests, one HTTP call per
@@ -1405,37 +1734,39 @@ async def no_dm_tracker(tracker_url, auth):
         # next cycle instead of killing the loop permanently.
         try:
             await asyncio.get_running_loop().run_in_executor(
-                None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
+                None, functools.partial(tracker_download.get_all_tracker_received_items,
+                                        tracker_url, auth, **_rk(run)))
             tracker_outage.ok()
         except Exception as e:
             tracker_outage.failed(e)
         await asyncio.sleep(_next_poll_delay(interval, time.monotonic() - started,
-                                             tracker_download.last_source))
+                                             tracker_download.source_for(run)))
 
 
-async def _hide_filler(diff):
+async def _hide_filler(diff, run=None):
     """The feed's diff without filler items, per the registered seed. Any problem getting the
     classifications leaves the diff as it was, so the feed never goes quiet by mistake."""
     try:
-        item_flags = await gomode_bot.load_item_flags()
+        item_flags = await gomode_bot.load_item_flags(**_rk(run))
         if not item_flags:
             return diff
-        return gomode_bot.drop_filler(diff, item_flags, gomode_bot._load_items_received())
+        return gomode_bot.drop_filler(diff, item_flags, gomode_bot._load_items_received(**_rk(run)))
     except Exception as e:
         log_error.exception("Filler filter failed, posting everything: %s", e)
         return diff
 
 
 # Loop function to check for changes every FEED_POLL_SECONDS (10 s) and post them to the feed channel.
-async def check_for_item_changes(tracker_url, auth, channel_id):
+async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
     await bot.wait_until_ready()
     channel = bot.get_channel(int(channel_id))
     if channel is None:
         log_config.error("Feed channel not found, the item feed is off")
         return
 
+    tracker_outage, feed_outage = _outages(run)
     interval = _feed_poll_seconds()
-    log_feed.info("Reading the tracker every %gs", interval)
+    log_feed.info("Reading the tracker every %gs%s", interval, f" for {run.name!r}" if run else "")
     quiet_cycles = 0
     while not bot.is_closed():
         started = time.monotonic()
@@ -1448,10 +1779,11 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
         # restarted, so an unhandled exception would stop tracking until a full bot restart).
         try:
             diff = await asyncio.get_running_loop().run_in_executor(
-                None, tracker_download.get_all_tracker_received_items, tracker_url, auth)
+                None, functools.partial(tracker_download.get_all_tracker_received_items,
+                                        tracker_url, auth, **_rk(run)))
             tracker_outage.ok()
             if diff:
-                diff = await _hide_filler(diff)
+                diff = await _hide_filler(diff, **_rk(run))
                 if not diff:
                     log_feed.info("Only filler items received, nothing posted")
             if diff:
@@ -1476,37 +1808,36 @@ async def check_for_item_changes(tracker_url, auth, channel_id):
 
         # Keep the pinned unfound-hints message(s) current (None: no hint data this run).
         try:
-            hints = tracker_download.load_hints()
+            hints = tracker_download.load_hints(**_rk(run))
             if hints is not None:
-                await hints_pin.sync(channel, hints)
+                await hints_pin.sync(channel, hints, **_rk(run))
         except Exception as e:
             log_error.exception("Pinned hints update failed, will retry next cycle: %s", e)
 
         # Wait out the rest of the interval before reading again (see _next_poll_delay).
         await asyncio.sleep(_next_poll_delay(interval, time.monotonic() - started,
-                                             tracker_download.last_source))
+                                             tracker_download.source_for(run)))
 
 
 # --- Hourly completion-percentage update ----------------------------------------------------
 # The tracker loop above rewrites data/items_received.json every feed poll, so this loop just reads
 # the per-slot "Checks Status" cells out of that file -- it makes no extra HTTP requests. The
 # last announced figure is persisted so a bot restart neither re-announces nor loses it.
-percentage_state_json = os.path.join("data", "percentage_state.json")
 
 
-def _load_percentage_state():
+def _load_percentage_state(run=None):
     try:
-        with open(percentage_state_json, "r") as f:
+        with open(runs.run_path("percentage_state.json", run), "r") as f:
             state = json.load(f)
     except FileNotFoundError:
         return None
     except Exception as e:
-        log_error.exception("Could not read %s: %s", os.path.basename(percentage_state_json), e)
+        log_error.exception("Could not read %s: %s", os.path.basename(runs.run_path("percentage_state.json", run)), e)
         return None
     return state if isinstance(state, dict) else None
 
 
-def _save_percentage_state(checked, total, percent_text):
+def _save_percentage_state(checked, total, percent_text, run=None):
     os.makedirs("data", exist_ok=True)
     state = {
         "checked": checked,
@@ -1515,10 +1846,10 @@ def _save_percentage_state(checked, total, percent_text):
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
     }
     try:
-        with open(percentage_state_json, "w") as f:
+        with open(runs.run_path("percentage_state.json", run), "w") as f:
             json.dump(state, f, indent=4)
     except Exception as e:
-        log_error.exception("Could not write %s: %s", os.path.basename(percentage_state_json), e)
+        log_error.exception("Could not write %s: %s", os.path.basename(runs.run_path("percentage_state.json", run)), e)
 
 
 def _seconds_until_next_hour():
@@ -1528,7 +1859,7 @@ def _seconds_until_next_hour():
     return max(1.0, (next_hour - now).total_seconds())
 
 
-async def hourly_percentage_loop(channel_id):
+async def hourly_percentage_loop(channel_id, run=None):
     """Once an hour, on the hour, post how the multiworld's completion percentage moved --
     but only when the figure actually changed, so quiet hours stay silent."""
     await bot.wait_until_ready()
@@ -1542,26 +1873,26 @@ async def hourly_percentage_loop(channel_id):
         # Wrapped so a transient error (unreadable data file, Discord hiccup) is logged and
         # retried next hour instead of killing the loop until a full bot restart.
         try:
-            await _report_percentage_change(channel)
+            await _report_percentage_change(channel, **_rk(run))
         except Exception as e:
             log_error.exception("Hourly percentage update failed, will retry next hour: %s", e)
 
 
-async def _report_percentage_change(channel):
-    completion = tracker_download.overall_completion()
+async def _report_percentage_change(channel, run=None):
+    completion = tracker_download.overall_completion(**_rk(run))
     if completion is None:
         log_feed.info("No parseable checks data yet, skipping this hour's percentage update")
         return
     checked, total = completion
     percent_text = f"{(checked / total) * 100:.2f}%"
 
-    state = _load_percentage_state()
+    state = _load_percentage_state(run)
     previous = (state or {}).get("percent")
 
     # First run (fresh install, or a brand new seed's first hour): record the baseline
     # silently -- there is no "went from" to report yet.
     if not previous:
-        _save_percentage_state(checked, total, percent_text)
+        _save_percentage_state(checked, total, percent_text, run)
         log_feed.info("Completion baseline recorded at %s (%s of %s checks)", percent_text, checked, total)
         return
 
@@ -1575,19 +1906,22 @@ async def _report_percentage_change(channel):
         f"Percentage went from **{previous}** to **{percent_text}** in the last hour! "
         f"({checked:,}/{total:,} checks)"
     )
-    _save_percentage_state(checked, total, percent_text)
+    _save_percentage_state(checked, total, percent_text, run)
     log_feed.info("Announced completion %s -> %s (%s of %s checks)", previous, percent_text, checked, total)
 
 
 # Slash command to DM the user a list of all items for their tracked slots.
 @bot.slash_command(description="Get a list of all items for your tracked slots.")
 async def get_all_tracked_items(ctx):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
     # Send an initial ephemeral response to let the user know we are processing.
     initial_response = await ctx.respond("Getting items...", ephemeral=True)
     author_id = str(ctx.author.id)
 
     os.makedirs("data", exist_ok=True)
-    listeners_data_json = os.path.join("data", "listeners.json")
+    listeners_data_json = runs.run_path("listeners.json", run)
 
     if not os.path.exists(listeners_data_json):
         await initial_response.edit_original_response(
@@ -1614,7 +1948,7 @@ async def get_all_tracked_items(ctx):
     tracked_assignments = listeners_data[author_id]
     combined_message = ""
     for assignment in tracked_assignments:
-        message = await send_items(ctx, assignment, initial_response)
+        message = await send_items(ctx, assignment, initial_response, run)
         combined_message += f"\n{message}\n"
 
     # Prepare the message for DM; use plain text code blocks.
@@ -1626,7 +1960,7 @@ async def get_all_tracked_items(ctx):
 
     try:
         for chunk in chunks:
-            await ctx.author.send(f"```ansi\n{chunk}\n```")
+            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
         await initial_response.edit_original_response(
             content="I've sent you a DM with a list of items for the slots you are tracking."
         )
@@ -1642,10 +1976,13 @@ async def get_all_tracked_items(ctx):
 @option("slot_name", description="Enter your slot name.", autocomplete=slot_name_for_assigned_game_autocomplete, required=True)
 @option("target_amount", description="Enter the number of items you are tracking for.", required=True)
 async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target_amount: int):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
     initial_response = await ctx.respond("tracking item...", ephemeral=True)
 
     os.makedirs("data", exist_ok=True)
-    listeners_data_json = os.path.join("data", "listeners.json")
+    listeners_data_json = runs.run_path("listeners.json", run)
 
     # Load existing listeners data (or initialize if not present)
     if os.path.exists(listeners_data_json):
@@ -1704,23 +2041,24 @@ async def track_item(ctx, game_name: str, item_name: str, slot_name: str, target
     )
 
 
-async def check_tracked_items_loop():
+async def check_tracked_items_loop(run=None):
     await bot.wait_until_ready()  # Ensure the bot is ready before starting the loop
     while not bot.is_closed():
         # Wrapped so a transient error never kills the loop (it is started once and never
         # restarted, so an unhandled exception would stop per-user item tracking until a full
         # bot restart).
         try:
-            await _run_tracked_items_check()
+            await _run_tracked_items_check(**_rk(run))
         except Exception as e:
             log_error.exception("Tracked-items check failed, will retry next cycle: %s", e)
         await asyncio.sleep(10)
 
 
-async def _run_tracked_items_check():
+async def _run_tracked_items_check(run=None):
     os.makedirs("data", exist_ok=True)
-    listeners_data_json = os.path.join("data", "listeners.json")
-    items_received_json = os.path.join("data", "items_received.json")
+    listeners_data_json = runs.run_path("listeners.json", run)
+    items_received_json = runs.run_path("items_received.json", run)
+    prefix = _dm_prefix(run)
 
     # Load items_received.json
     try:
@@ -1805,7 +2143,7 @@ async def _run_tracked_items_check():
             try:
                 user_obj = await bot.fetch_user(int(user_id))
                 if user_obj:
-                    await user_obj.send("\n".join(user_messages))
+                    await user_obj.send("\n".join(prefix + m for m in user_messages))
             except discord.Forbidden:
                 log_error.warning("Could not DM Discord user %s about a tracked item (DMs disabled)", user_id)
             except Exception as e:
@@ -1817,34 +2155,35 @@ async def _run_tracked_items_check():
             json.dump(listeners_data, f, indent=4)
 
 
-async def check_unstuck_loop():
+async def check_unstuck_loop(run=None):
     """Opt-in alerts: DM a player when a slot they signed up for goes from nothing left to do in
     logic to having checks again. Players sign up with /unstuck_alerts."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            await _run_unstuck_alerts()
+            await _run_unstuck_alerts(**_rk(run))
         except Exception as e:  # never let one bad cycle kill the loop
             log_error.exception("Unstuck alert check failed: %s", e)
         await asyncio.sleep(120)
 
 
-async def _run_unstuck_alerts():
-    reg = gomode_bot.load_registry()
+async def _run_unstuck_alerts(run=None):
+    reg = gomode_bot.load_registry(**_rk(run))
     if not reg:
         return
     seed = reg.get("seed")
+    prefix = _dm_prefix(run)
     slot_to_users = {}
-    for user_id, names in gomode_bot.load_unstuck_subscriptions().items():
+    for user_id, names in gomode_bot.load_unstuck_subscriptions(**_rk(run)).items():
         for name in names:
             slot_to_users.setdefault(name, set()).add(user_id)
     if not slot_to_users:
         return
 
-    items_received = gomode_bot._load_items_received()
-    status = await gomode_bot.checks_in_logic(list(slot_to_users), items_received=items_received)
-    state = gomode_bot.load_unstuck_state(seed)
-    item_flags = await gomode_bot.load_item_flags() or {}
+    items_received = gomode_bot._load_items_received(**_rk(run))
+    status = await gomode_bot.checks_in_logic(list(slot_to_users), items_received=items_received, **_rk(run))
+    state = gomode_bot.load_unstuck_state(seed, **_rk(run))
+    item_flags = await gomode_bot.load_item_flags(**_rk(run)) or {}
     changed = False
     for name, user_ids in slot_to_users.items():
         st = status.get(name, {})
@@ -1868,7 +2207,7 @@ async def _run_unstuck_alerts():
                      for item, count in inventory.items()
                      if count > before.get(item, 0) and flags.get(item) != 0]
         game = st.get("game") or ""
-        msg = (f"🔓 **{name}**" + (f" ({game})" if game else "") +
+        msg = (prefix + f"🔓 **{name}**" + (f" ({game})" if game else "") +
                f" has **{to_do}** check{'s' if to_do != 1 else ''} in logic again.")
         if new_items:
             msg += "\nNew since then: " + ", ".join(new_items[:15])
@@ -1885,19 +2224,19 @@ async def _run_unstuck_alerts():
 
     if changed:
         try:
-            gomode_bot.save_unstuck_state(seed, state)
+            gomode_bot.save_unstuck_state(seed, state, **_rk(run))
         except Exception as e:
             log_error.exception("Could not save the unstuck state: %s", e)
 
 
-async def check_go_mode_loop():
+async def check_go_mode_loop(run=None):
     """Edge-triggered go-mode notifications: DM the player who holds a slot the moment it
     reaches go mode. Verified slots are evaluated instantly in-process; the few fallback
     slots share one fast oracle subprocess. Each slot is notified once per registered seed."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            await _run_go_mode_notifications()
+            await _run_go_mode_notifications(**_rk(run))
         except Exception as e:  # never let one bad cycle kill the loop
             log_error.exception("Go-mode notification check failed: %s", e)
         await asyncio.sleep(120)
@@ -1906,23 +2245,26 @@ async def check_go_mode_loop():
 # Process-level guards so a persistence failure can't cause re-DMing, and so slots whose
 # inventory hasn't changed aren't rebuilt every cycle. Both are keyed with the seed so they
 # self-reset when a new seed is registered.
-_go_mode_dm_sent = set()       # {(seed, author_id, slot_name)} delivered this process run
-_go_mode_checked_sig = {}      # {slot_name: (seed, inventory_signature)} last "not yet" check
+# Both are also keyed with the run, so two runs with a slot of the same name stay apart.
+_go_mode_dm_sent = set()       # {(run id, seed, author_id, slot_name)} delivered this process run
+_go_mode_checked_sig = {}      # {(run id, slot_name): (seed, inventory_signature)} last "not yet" check
 
 
 def _inventory_sig(inv: dict):
     return tuple(sorted(inv.items()))
 
 
-async def _run_go_mode_notifications():
-    reg = gomode_bot.load_registry()
+async def _run_go_mode_notifications(run=None):
+    reg = gomode_bot.load_registry(**_rk(run))
     if not reg:
         return  # no seed registered yet
     seed = reg.get("seed")
+    rid = _run_key(run)
+    prefix = _dm_prefix(run)
 
     # slot_name -> set of Discord user ids assigned to it (usually exactly one)
     slot_to_authors = {}
-    for author_id, assignments in _load_listeners().items():
+    for author_id, assignments in _load_listeners(**_rk(run)).items():
         for a in assignments:
             sn = a.get("slot_name")
             if sn:
@@ -1930,7 +2272,7 @@ async def _run_go_mode_notifications():
     if not slot_to_authors:
         return
 
-    notified = gomode_bot.load_notified(seed)  # set of "author_id:slot_name" tokens
+    notified = gomode_bot.load_notified(seed, **_rk(run))  # set of "author_id:slot_name" tokens
 
     def tok(author_id, sn):
         return f"{author_id}:{sn}"  # author_id is always numeric, so this is unambiguous
@@ -1939,9 +2281,9 @@ async def _run_go_mode_notifications():
         # Authors for this slot not yet notified (persisted OR delivered this run). Keyed
         # per (author, slot) so a late-assigned author still gets the DM.
         return [a for a in slot_to_authors[sn]
-                if tok(a, sn) not in notified and (seed, a, sn) not in _go_mode_dm_sent]
+                if tok(a, sn) not in notified and (rid, seed, a, sn) not in _go_mode_dm_sent]
 
-    items_received = gomode_bot._load_items_received()
+    items_received = gomode_bot._load_items_received(**_rk(run))
 
     # A slot that already reached its goal has no use for a go-mode alert.
     candidate_slots = [sn for sn in slot_to_authors
@@ -1954,13 +2296,13 @@ async def _run_go_mode_notifications():
     to_check = []
     for sn in candidate_slots:
         sig = (seed, _inventory_sig(gomode_bot.inventory_for_slot(items_received, sn)))
-        if _go_mode_checked_sig.get(sn) == sig:
+        if _go_mode_checked_sig.get((rid, sn)) == sig:
             continue
         to_check.append(sn)
     if not to_check:
         return
 
-    status = await gomode_bot.go_mode_status(to_check, items_received=items_received)
+    status = await gomode_bot.go_mode_status(to_check, items_received=items_received, **_rk(run))
 
     changed = False
     for sn in to_check:
@@ -1968,12 +2310,12 @@ async def _run_go_mode_notifications():
         igm = st.get("in_go_mode")
         # Remember a definitive "not yet" so we don't rebuild next cycle.
         if st.get("status") == "ok" and igm is False:
-            _go_mode_checked_sig[sn] = (
+            _go_mode_checked_sig[(rid, sn)] = (
                 seed, _inventory_sig(gomode_bot.inventory_for_slot(items_received, sn)))
         if not (st.get("status") == "ok" and igm is True):
             continue
         game = st.get("game") or ""
-        msg = (f"🎉 **{sn}**" + (f" ({game})" if game else "") +
+        msg = (prefix + f"🎉 **{sn}**" + (f" ({game})" if game else "") +
                " has reached **go mode** — you now have everything you need to reach your "
                "goal in logic. Congrats!")
         for author_id in pending_authors(sn):
@@ -1984,7 +2326,7 @@ async def _run_go_mode_notifications():
                     # Mark notified ONLY after the DM actually sends, so a closed-DM/transient
                     # failure is retried next cycle instead of being silently lost.
                     notified.add(tok(author_id, sn))
-                    _go_mode_dm_sent.add((seed, author_id, sn))
+                    _go_mode_dm_sent.add((rid, seed, author_id, sn))
                     changed = True
                     # Logged after the bookkeeping, so a logging problem can never cause a repeat DM.
                     log_goal.info("Told %s that %s reached go mode", getattr(user, "name", author_id), sn)
@@ -1995,7 +2337,7 @@ async def _run_go_mode_notifications():
 
     if changed:
         try:
-            gomode_bot.save_notified(seed, notified)
+            gomode_bot.save_notified(seed, notified, **_rk(run))
         except Exception as e:
             # Persistence failed, but the in-process guard already prevents re-DMing this run.
             log_error.exception("Could not save the go-mode notified state: %s", e)

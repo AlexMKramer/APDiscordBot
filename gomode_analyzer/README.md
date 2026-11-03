@@ -99,10 +99,14 @@ Config (environment):
 | Var | Purpose |
 |-----|---------|
 | `GOMODE_AP_PYTHON` | Python interpreter with Archipelago's deps (runs the precompute). |
-| `GOMODE_APWORLDS_DIR` | The host's `custom_worlds/` on the bot server (FTP'd there). |
+| `GOMODE_APWORLDS_DIR` | The host's `custom_worlds/` on the bot server (FTP'd there). With several runs, a folder inside it named after a run (its name, else its id) holds that run's own set of apworlds; a run without one uses the apworlds directly in this directory. See `docs/RUNS.md`. |
 | `GOMODE_AP_REPO` | *(optional)* local AP git checkout for offline provisioning; else GitHub. |
 | `GOMODE_RUNTIME_DIR` | Where provisioned trees + the seed cache live (default `gomode_analyzer/runtime`). |
 | `GOMODE_OWNER_ID` / `OWNER_ID` | Discord user allowed to register; else the guild owner. |
+
+With several runs linked (see `docs/RUNS.md`), `/register_seed` registers the seed for the run of the channel it is
+used in, and each run has its own analyzer, Archipelago tree and apworlds (`runtime/<run>/`), seed cache (`runtime/<run>/seed_cache.json`) and `data/runs/<run>/` copies of
+the `data/` files named below.
 
 ### Player-facing surfaces (after registration)
 

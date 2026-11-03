@@ -7,6 +7,7 @@ deleted ones recreated.
 """
 import json
 import os
+import runs
 
 import discord
 
@@ -14,7 +15,6 @@ import log_setup
 
 log = log_setup.get("hints")
 
-STATE_JSON = os.path.join("data", "hints_pin_state.json")
 MAX_LEN = 1900
 EMPTY_TEXT = "**Unfound hints**\nNone right now."
 
@@ -50,19 +50,19 @@ def render_pages(hints, max_len=MAX_LEN):
     return pages
 
 
-def _load_state():
+def _load_state(run=None):
     try:
-        with open(STATE_JSON, encoding="utf-8") as fh:
+        with open(runs.run_path("hints_pin_state.json", run), encoding="utf-8") as fh:
             return json.load(fh).get("message_ids", [])
     except (OSError, json.JSONDecodeError):
         return []
 
 
-def _save_state(ids):
+def _save_state(ids, run=None):
     os.makedirs("data", exist_ok=True)
-    with open(STATE_JSON + ".tmp", "w", encoding="utf-8") as fh:
+    with open(runs.run_path("hints_pin_state.json", run) + ".tmp", "w", encoding="utf-8") as fh:
         json.dump({"message_ids": ids}, fh)
-    os.replace(STATE_JSON + ".tmp", STATE_JSON)
+    os.replace(runs.run_path("hints_pin_state.json", run) + ".tmp", runs.run_path("hints_pin_state.json", run))
 
 
 _no_mentions = discord.AllowedMentions.none()
@@ -82,8 +82,13 @@ async def _pin(message):
         log.error("Pinning the hints message failed: %s", e)
 
 
-async def sync(channel, hints, load_state=_load_state, save_state=_save_state):
-    """Make the channel's hint message(s) match the hints (a list of dicts from tracker_download)."""
+async def sync(channel, hints, load_state=None, save_state=None, run=None):
+    """Make the channel's hint message(s) match the hints (a list of dicts from tracker_download).
+    The message ids are remembered per run (run=None: the only run, or the single-run setup)."""
+    if load_state is None:
+        load_state = lambda: _load_state(run)  # noqa: E731
+    if save_state is None:
+        save_state = lambda ids: _save_state(ids, run)  # noqa: E731
     pages = render_pages(hints)
     old_ids = load_state()
     new_ids = []

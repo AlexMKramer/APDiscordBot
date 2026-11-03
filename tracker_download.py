@@ -1,5 +1,6 @@
 import json
 import os
+import runs
 import threading
 import time
 
@@ -133,14 +134,31 @@ def track_items_from_slot(tracker_url, url, auth):
 # (seen with Cookie Clicker, whose apworld has no manifest), and those slots stay on the page.
 
 DATAPACKAGE_DIR = os.path.join("data", "datapackage_cache")
-START_INVENTORY_JSON = os.path.join("data", "start_inventory.json")
 _names_memo = {}       # checksum -> (item id -> name, location id -> name)
 _static_memo = {}      # tracker id -> /api/static_tracker response
 _api_warned = False
 last_source = "api"   # where the latest read came from: "api" or "pages" (the slow fallback)
 _read_lock = threading.Lock()   # one read at a time: it rewrites items_received.json and diffs against it
 _last_hints = None     # unfound hints from the latest API read; None when it came from the pages
-HINTS_JSON = os.path.join("data", "hints.json")
+
+# The four values above are the state of the single run (no registry). Each linked run keeps its own
+# in _run_state, so two runs never share a lock, a source or a hints list.
+_run_state = {}        # run id -> {"api_warned", "last_source", "last_hints", "lock"}
+_state_guard = threading.Lock()
+
+
+def _state(run):
+    if run is None:
+        return None
+    with _state_guard:
+        return _run_state.setdefault(run.id, {"api_warned": False, "last_source": "api",
+                                              "last_hints": None, "lock": threading.Lock()})
+
+
+def source_for(run=None):
+    """Where the latest read for this run came from: "api" or "pages"."""
+    st = _state(run)
+    return st["last_source"] if st else last_source
 
 
 def _split_tracker_url(tracker_url):
@@ -164,9 +182,11 @@ def _names_for(base, checksum, auth):
         except (FileNotFoundError, json.JSONDecodeError):
             package = _get_json(f"{base}/api/datapackage/{checksum}", auth)
             os.makedirs(DATAPACKAGE_DIR, exist_ok=True)
-            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+            # two runs can fetch the same package at once: each writes its own temporary file
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(package, fh)
-            os.replace(path + ".tmp", path)
+            os.replace(tmp, path)
         _names_memo[checksum] = ({v: k for k, v in package.get("item_name_to_id", {}).items()},
                                  {v: k for k, v in package.get("location_name_to_id", {}).items()})
     return _names_memo[checksum]
@@ -176,12 +196,12 @@ def _received_names(api_items, item_names):
     return [item_names.get(entry[0], str(entry[0])) for entry in api_items]
 
 
-def _start_inventories(tracker_url, auth, tracker_id, slots, received_now):
+def _start_inventories(tracker_url, auth, tracker_id, slots, received_now, run=None):
     """{slot name: {"start": {item: count}, "page": bool}}. Start inventory is the slot page's
     counts (which include start items) minus what the API says was received. "page" marks a
     slot whose page names don't match the API datapackage, so it keeps being read from its page."""
     try:
-        with open(START_INVENTORY_JSON, encoding="utf-8") as fh:
+        with open(runs.run_path("start_inventory.json", run), encoding="utf-8") as fh:
             cached = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         cached = {}
@@ -221,9 +241,9 @@ def _start_inventories(tracker_url, auth, tracker_id, slots, received_now):
                                          for name, count in page_counts.items()
                                          if count > api_counts.get(name, 0)},
                                "page": False}
-    with open(START_INVENTORY_JSON + ".tmp", "w", encoding="utf-8") as fh:
+    with open(runs.run_path("start_inventory.json", run) + ".tmp", "w", encoding="utf-8") as fh:
         json.dump({"tracker": tracker_id, "slots": known}, fh)
-    os.replace(START_INVENTORY_JSON + ".tmp", START_INVENTORY_JSON)
+    os.replace(runs.run_path("start_inventory.json", run) + ".tmp", runs.run_path("start_inventory.json", run))
     return known
 
 
@@ -264,16 +284,16 @@ def unfound_hints(api_hints, slot_names, item_names_by_player, location_names_by
                                                 h["location"].lower(), h["item"].lower()))
 
 
-def load_hints():
+def load_hints(run=None):
     """The unfound hints last written by the tracker loop, or None if there is no data."""
     try:
-        with open(HINTS_JSON, encoding="utf-8") as fh:
+        with open(runs.run_path("hints.json", run), encoding="utf-8") as fh:
             return json.load(fh).get("hints")
     except (OSError, json.JSONDecodeError):
         return None
 
 
-def _result_from_api(tracker_url, auth):
+def _result_from_api(tracker_url, auth, run=None):
     """The same {slot: {slot_name: {...}}} shape the page scraper builds, from the JSON API."""
     base, tracker_id = _split_tracker_url(tracker_url)
     slot_numbers, urls, slot_names, game_names, games_statuses, checks_statuses = get_tracker_urls(tracker_url, auth)
@@ -293,22 +313,23 @@ def _result_from_api(tracker_url, auth):
                       "item_names": set(item_names.values()), "location_names": set(location_names.values()),
                       "received": _received_names(received.get((team, player), []), item_names),
                       "checked": [location_names.get(loc, str(loc)) for loc in checked.get((team, player), [])]})
-    start = _start_inventories(tracker_url, auth, tracker_id, slots, received)
+    start = _start_inventories(tracker_url, auth, tracker_id, slots, received, run)
 
     # Item names belong to the receiving player's game, location names to the finding player's.
-    global _last_hints
+    st = _state(run)
     # A slot whose API names don't match its room (see above) gets ids rather than wrong names.
     by_player = {slot["player"]: ({**slot, "item_by_id": {}, "location_by_id": {}}
                                   if start.get(slot["name"], {}).get("page") else slot)
                  for slot in slots}
     try:
-        _last_hints = unfound_hints(
+        hints = unfound_hints(
             tracker.get("hints"), {n: s["name"] for n, s in by_player.items()},
             {n: s["item_by_id"] for n, s in by_player.items()},
             {n: s["location_by_id"] for n, s in by_player.items()})
     except Exception as e:
         log_error.exception("Could not read the tracker hints: %s", e)
-        _last_hints = None
+        hints = None
+    _set_hints(run, hints)
 
     result = {}
     for slot in slots:
@@ -340,12 +361,21 @@ def _result_from_api(tracker_url, auth):
     return result
 
 
-def _write_hints(hints):
-    with open(HINTS_JSON + ".tmp", "w", encoding="utf-8") as fh:
+def _set_hints(run, hints):
+    global _last_hints
+    st = _state(run)
+    if st:
+        st["last_hints"] = hints
+    else:
+        _last_hints = hints
+
+
+def _write_hints(hints, run=None):
+    with open(runs.run_path("hints.json", run) + ".tmp", "w", encoding="utf-8") as fh:
         json.dump({"hints": hints}, fh, indent=2)
     for attempt in range(10):
         try:
-            os.replace(HINTS_JSON + ".tmp", HINTS_JSON)
+            os.replace(runs.run_path("hints.json", run) + ".tmp", runs.run_path("hints.json", run))
             break
         except PermissionError:
             if attempt == 9:
@@ -382,7 +412,6 @@ def _result_from_pages(tracker_url, auth):
     return result
 
 
-ANNOUNCED_JSON = os.path.join("data", "announced_marks.json")
 
 
 def _int(value):
@@ -421,13 +450,13 @@ def _goal_done(details):
     return str(details.get("Game Status", "")).strip().lower() in ("goal completed", "completed")
 
 
-def _load_marks(tracker_id, old_result):
+def _load_marks(tracker_id, old_result, run=None):
     """The announced marks for this room: {"tracker", "items": {slot: {item: count}}, "goals": [slot]}.
 
     A different room starts from nothing. With no marks file yet, they start from the last saved
     result so an update does not announce the whole inventory again."""
     try:
-        with open(ANNOUNCED_JSON, encoding="utf-8") as fh:
+        with open(runs.run_path("announced_marks.json", run), encoding="utf-8") as fh:
             saved = json.load(fh)
         if saved.get("tracker") != tracker_id:
             return {"tracker": tracker_id, "items": {}, "goals": []}
@@ -438,12 +467,12 @@ def _load_marks(tracker_id, old_result):
         return marks
 
 
-def _save_marks(marks):
-    with open(ANNOUNCED_JSON + ".tmp", "w", encoding="utf-8") as fh:
+def _save_marks(marks, run=None):
+    with open(runs.run_path("announced_marks.json", run) + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(marks, fh)
     for attempt in range(10):
         try:
-            os.replace(ANNOUNCED_JSON + ".tmp", ANNOUNCED_JSON)
+            os.replace(runs.run_path("announced_marks.json", run) + ".tmp", runs.run_path("announced_marks.json", run))
             break
         except PermissionError:
             if attempt == 9:
@@ -497,32 +526,42 @@ def _diff_against_marks(result, marks):
     return diff
 
 
-def get_all_tracker_received_items(tracker_url, auth):
-    with _read_lock:
-        return _read_tracker(tracker_url, auth)
+def get_all_tracker_received_items(tracker_url, auth, run=None):
+    st = _state(run)
+    with (st["lock"] if st else _read_lock):
+        return _read_tracker(tracker_url, auth, run)
 
 
-def _read_tracker(tracker_url, auth):
-    global _api_warned, _last_hints, last_source
+def _read_tracker(tracker_url, auth, run=None):
+    global _api_warned, last_source
+    st = _state(run)
+    # A run is passed on only when there is one, so the single-run path calls the readers as before.
+    extra = (run,) if run is not None else ()
+    warned = st["api_warned"] if st else _api_warned
     try:
-        _last_hints = None
-        result = _result_from_api(tracker_url, auth)
-        if _api_warned:
-            log.info("Tracker JSON API is back")
-        _api_warned = False
-        last_source = "api"
+        _set_hints(run, None)
+        result = _result_from_api(tracker_url, auth, *extra)
+        if warned:
+            log.info("Tracker JSON API is back%s", f" ({run.name})" if run else "")
+        warned = False
+        source = "api"
     except Exception as e:
-        last_source = "pages"
-        _last_hints = None
+        source = "pages"
+        _set_hints(run, None)
         # An older WebHost without the API, or a hiccup: read every slot's page instead.
-        if not _api_warned:
-            log.warning("Tracker JSON API unavailable, reading every slot page instead: %s", e)
-            _api_warned = True
+        if not warned:
+            log.warning("Tracker JSON API unavailable, reading every slot page instead%s: %s",
+                        f" ({run.name})" if run else "", e)
+            warned = True
         result = _result_from_pages(tracker_url, auth)
+    if st:
+        st["api_warned"], st["last_source"] = warned, source
+    else:
+        _api_warned, last_source = warned, source
 
     # Ensure the data subdirectory exists.
     os.makedirs("data", exist_ok=True)
-    items_received_json = os.path.join("data", "items_received.json")
+    items_received_json = runs.run_path("items_received.json", run)
 
     # Load previous results, if they exist.
     old_result = {}
@@ -543,9 +582,9 @@ def _read_tracker(tracker_url, auth):
         tracker_id = _split_tracker_url(tracker_url)[1]
     except ValueError:
         tracker_id = tracker_url
-    marks = _load_marks(tracker_id, old_result)
+    marks = _load_marks(tracker_id, old_result, run)
     diff = _diff_against_marks(result, marks)
-    _save_marks(marks)
+    _save_marks(marks, run)
 
     # Write to a temp file and swap it in: other loops read this file while it's being written,
     # and a half-written file reads as empty (no items, nothing checked).
@@ -561,8 +600,9 @@ def _read_tracker(tracker_url, auth):
             time.sleep(0.1)
 
     # Hints only come from the API; the page fallback leaves the last file as it was.
-    if _last_hints is not None:
-        _write_hints(_last_hints)
+    hints = st["last_hints"] if st else _last_hints
+    if hints is not None:
+        _write_hints(hints, run)
 
     return diff
 
@@ -585,14 +625,14 @@ def parse_checks_status(text):
     return checked, total
 
 
-def overall_completion(items_received=None):
+def overall_completion(items_received=None, run=None):
     """Sum every slot's "Checks Status" into (checked, total) for the whole multiworld.
 
     Reads data/items_received.json (rewritten by get_all_tracker_received_items every cycle)
     when no data is passed, so callers cost no extra HTTP requests. Returns None when no slot
     reports a parseable checks count."""
     if items_received is None:
-        items_received_json = os.path.join("data", "items_received.json")
+        items_received_json = runs.run_path("items_received.json", run)
         try:
             with open(items_received_json, "r") as infile:
                 items_received = json.load(infile)

@@ -4,6 +4,7 @@ import re
 import time
 from json import JSONEncoder, JSONDecoder
 import os
+import runs
 from time import sleep
 
 from discord.ext import tasks
@@ -15,19 +16,42 @@ log = log_setup.get('conn')
 log_items = log_setup.get('items')
 log_error = log_setup.get('error')
 
-is_websocket_connected = False
-auto_reconnect = False
-packet_queue = asyncio.Queue()
+class Conn:
+    """One run's connection to its Archipelago server: the websocket flags, the packet queue and
+    the progress of a get_server_data run. Two runs each have their own, so two sockets can be
+    open at once and neither reads the other's packets.
 
-# One-shot data-collection progress for a get_server_data run. The bot only needs to
-# stay connected long enough to receive the slot info (the "Connected" packet) and a
-# data package for every game in the room; once it has those it disconnects (per the
-# README: "get the packets it needs, and disconnect"). These reset at the start of main().
-room_info_received = False
-connected_received = False
-expected_data_packages = 0
-received_data_packages = 0
-intentional_close = False
+    The bot only needs to stay connected long enough to receive the slot info (the "Connected"
+    packet) and a data package for every game in the room; once it has those it disconnects (per
+    the README: "get the packets it needs, and disconnect"). The progress fields reset at the
+    start of main()."""
+
+    def __init__(self, run=None):
+        self.run = run
+        self.is_websocket_connected = False
+        self.auto_reconnect = False
+        self.packet_queue = asyncio.Queue()
+        self.room_info_received = False
+        self.connected_received = False
+        self.expected_data_packages = 0
+        self.received_data_packages = 0
+        self.intentional_close = False
+        self.slot_mapping = {}
+        self.data_package_mapping = []
+        self.reader = None   # this connection's packet-reading loop, made on first use
+
+
+_conns = {}   # run id ("" when there are no runs) -> Conn
+
+
+def conn_for(run=None):
+    """The connection of this run (run=None: the only run, or the single-run setup)."""
+    run = run or runs.default_run()
+    key = run.id if run else ""
+    if key not in _conns:
+        _conns[key] = Conn(run)
+    return _conns[key]
+
 
 def encode(data):
     return JSONEncoder(
@@ -42,9 +66,8 @@ def decode(data):
 
 
 # Send the initial connection to the server
-async def send_connect_packet(websocket, slot_name, password):
-    global auto_reconnect
-    auto_reconnect = True
+async def send_connect_packet(conn, websocket, slot_name, password):
+    conn.auto_reconnect = True
 
     payload = [{
         'cmd': 'Connect',
@@ -61,21 +84,19 @@ async def send_connect_packet(websocket, slot_name, password):
 
 
 # Disconnect from the server
-async def disconnect(websocket):
+async def disconnect(conn, websocket):
     await websocket.close()
-    global is_websocket_connected, auto_reconnect
-    is_websocket_connected = False
+    conn.is_websocket_connected = False
     log.info("Disconnected from the Archipelago server")
-    auto_reconnect = False
+    conn.auto_reconnect = False
 
-async def check_connection(websocket, slot_name, password):
-    global is_websocket_connected, auto_reconnect
+async def check_connection(conn, websocket, slot_name, password):
     while True:
         await asyncio.sleep(10)
-        if not is_websocket_connected:
-            if auto_reconnect:
+        if not conn.is_websocket_connected:
+            if conn.auto_reconnect:
                 log.info("Not connected, sending the connect request again")
-                await send_connect_packet(websocket, slot_name, password)
+                await send_connect_packet(conn, websocket, slot_name, password)
             else:
                 log.info("Reconnecting is off, leaving the connection check")
                 break
@@ -179,37 +200,33 @@ async def build_reverse_data_package_mapping(data_package):
 
 
 # Listen for packets being sent to us and send them to the read_response function
-async def handle_messages(discord_ack, websocket):
-    global is_websocket_connected
+async def handle_messages(conn, discord_ack, websocket):
     try:
         while websocket.state == websockets.protocol.State.OPEN:
-            is_websocket_connected = True
+            conn.is_websocket_connected = True
             response = await websocket.recv()
             # Process response (assuming response is a JSON-encoded list of messages)
             for msg in decode(response):
-                await add_packet_to_queue(discord_ack, websocket, msg)
+                await add_packet_to_queue(conn, discord_ack, websocket, msg)
     except websockets.exceptions.ConnectionClosed:
-        is_websocket_connected = False
+        conn.is_websocket_connected = False
         # Don't clobber the success/refusal message when we closed on purpose.
-        if not intentional_close:
+        if not conn.intentional_close:
             await discord_ack.edit_original_response(content="Connection was closed.")
         log.info("Archipelago connection closed")
 
-async def add_packet_to_queue(discord_ack, websocket, packet):
-    await packet_queue.put((discord_ack, websocket, packet))
-    log.debug("Packet queued, queue size %s", packet_queue.qsize())
+async def add_packet_to_queue(conn, discord_ack, websocket, packet):
+    await conn.packet_queue.put((discord_ack, websocket, packet))
+    log.debug("Packet queued, queue size %s", conn.packet_queue.qsize())
 
 
 # Read the provided packet and process it by type
-@tasks.loop(seconds=1)
-async def read_response():
-    global is_websocket_connected, auto_reconnect
-    global room_info_received, connected_received, expected_data_packages, received_data_packages, intentional_close
+async def read_response(conn):
     try:
-        if not packet_queue.empty():
-            discord_ack, websocket, msg = await packet_queue.get()
+        if not conn.packet_queue.empty():
+            discord_ack, websocket, msg = await conn.packet_queue.get()
             if msg.get("cmd") == "Connected":
-                connected_received = True
+                conn.connected_received = True
                 log.info("Connected to the Archipelago server, %s slots in the room", len(msg.get("slot_info", {})))
 
                 slot_info = msg.get("slot_info", {})
@@ -220,15 +237,15 @@ async def read_response():
                         "slot_name": info.get("name", "Unknown"),
                         "game": info.get("game", "Unknown")
                     }
-                main.slot_mapping = slot_mapping
+                conn.slot_mapping = slot_mapping
 
                 os.makedirs("data", exist_ok=True)
-                slot_info_json = os.path.join("data", "slot_info.json")
+                slot_info_json = runs.run_path("slot_info.json", conn.run)
                 with open (slot_info_json, "w") as f:
                     json.dump(slot_mapping, f, indent=4)
 
-                is_websocket_connected = True
-                auto_reconnect = True
+                conn.is_websocket_connected = True
+                conn.auto_reconnect = True
                 await discord_ack.edit_original_response(content="Connected to the server")
 
 
@@ -237,18 +254,18 @@ async def read_response():
             elif msg.get("cmd") == "RoomInfo":
                 log.debug("Got room info packet")
                 games_in_server = msg.get("games", {})
-                room_info_received = True
+                conn.room_info_received = True
                 # We request one data package per game, so expect one response each.
-                expected_data_packages = len(games_in_server)
+                conn.expected_data_packages = len(games_in_server)
                 for game in games_in_server:
                     log.info("Asking for the data package of %s", game)
                     await get_data_package(websocket, game)
 
             elif msg.get("cmd") == "DataPackage":
-                log.info("Got a data package (%s of %s)", received_data_packages + 1, expected_data_packages)
-                received_data_packages += 1
+                log.info("Got a data package (%s of %s)", conn.received_data_packages + 1, conn.expected_data_packages)
+                conn.received_data_packages += 1
 
-                main.data_package_mapping = await process_data_package(msg["data"])
+                conn.data_package_mapping = await process_data_package(msg["data"])
 
             elif msg.get("cmd") == "PrintJSON":
                 if msg.get("type") == "ItemSend":
@@ -272,11 +289,11 @@ async def read_response():
                         log_error.warning("Item message had an unexpected set of players %s, skipped", player_ids)
                         return
 
-                    sender_name = main.slot_mapping.get(sender_slot_id, {}).get("slot_name", "Unknown")
-                    sender_game = main.slot_mapping.get(sender_slot_id, {}).get("game", "Unknown")
+                    sender_name = conn.slot_mapping.get(sender_slot_id, {}).get("slot_name", "Unknown")
+                    sender_game = conn.slot_mapping.get(sender_slot_id, {}).get("game", "Unknown")
 
-                    receiver_name = main.slot_mapping.get(receiver_slot_id, {}).get("slot_name", "Unknown")
-                    receiver_game = main.slot_mapping.get(receiver_slot_id, {}).get("game", "Unknown")
+                    receiver_name = conn.slot_mapping.get(receiver_slot_id, {}).get("slot_name", "Unknown")
+                    receiver_game = conn.slot_mapping.get(receiver_slot_id, {}).get("game", "Unknown")
 
                     item_id = [element.get("text") for element in data_array if element.get("type") == "item_id"]
                     item_flag = [element.get("flags") for element in data_array if element.get("type") == "item_id"]
@@ -325,7 +342,7 @@ async def read_response():
 
                     # Store the packet data
                     os.makedirs("data", exist_ok=True)
-                    items_received_json = os.path.join("data", "items_received.json")
+                    items_received_json = runs.run_path("items_received.json", conn.run)
 
                     # Load existing data, or initialize if file doesn't exist
                     if os.path.exists(items_received_json):
@@ -367,67 +384,68 @@ async def read_response():
                 else:
                     reason = str(errors)
                 log.error("Archipelago server refused the connection: %s", reason)
-                intentional_close = True
+                conn.intentional_close = True
                 await discord_ack.edit_original_response(
                     content=f"The server refused the connection: {reason}. Check the slot name and password."
                 )
-                await disconnect(websocket)
-                is_websocket_connected = False
+                await disconnect(conn, websocket)
+                conn.is_websocket_connected = False
             elif msg.get("cmd") == "Bounced":
                 log.debug("Bounced packet")
             else:
                 log.debug("Ignored a %s packet", msg.get("cmd"))
 
             # Once we have the slot info and every game's data package, we're done.
-            await finish_data_collection_if_complete(discord_ack, websocket)
+            await finish_data_collection_if_complete(conn, discord_ack, websocket)
     except Exception as e:
         log_error.exception("Could not process a packet from the Archipelago server: %s", e)
         await discord_ack.edit_original_response(content=f"An error occurred while processing the packet: {e}")
 
 
-async def finish_data_collection_if_complete(discord_ack, websocket):
+async def finish_data_collection_if_complete(conn, discord_ack, websocket):
     """Disconnect once the bot has everything a get_server_data run needs: the slot
     info from the Connected packet and a data package for every game in the room."""
-    global intentional_close
-    if intentional_close:
+    if conn.intentional_close:
         return
-    if not (room_info_received and connected_received):
+    if not (conn.room_info_received and conn.connected_received):
         return
-    if received_data_packages < expected_data_packages:
+    if conn.received_data_packages < conn.expected_data_packages:
         return
 
-    intentional_close = True
+    conn.intentional_close = True
     await discord_ack.edit_original_response(
-        content=f"Collected all server data ({received_data_packages} game data package(s)). "
+        content=f"Collected all server data ({conn.received_data_packages} game data package(s)). "
                 f"Disconnecting -- you can now use the other commands."
     )
-    await disconnect(websocket)
+    await disconnect(conn, websocket)
 
 
 
-async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bot", password=""):
+async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bot", password="", run=None):
+    conn = conn_for(run)
+    conn.auto_reconnect = False
 
-    global is_websocket_connected, auto_reconnect
-    global room_info_received, connected_received, expected_data_packages, received_data_packages, intentional_close
-    auto_reconnect = False
-
-    # Reset one-shot data-collection progress for this run.
-    room_info_received = False
-    connected_received = False
-    expected_data_packages = 0
-    received_data_packages = 0
-    intentional_close = False
+    # Reset one-shot data-collection progress for this connection.
+    conn.room_info_received = False
+    conn.connected_received = False
+    conn.expected_data_packages = 0
+    conn.received_data_packages = 0
+    conn.intentional_close = False
 
     # Normalize the address: trim whitespace and strip any scheme the user pasted
     # (e.g. "https://host:port" -> "host:port") so we don't build "ws://https://...",
     # which would make the resolver try to look up a host literally named "https".
     cleaned = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", "", address.strip())
 
-    # read_response is a persistent tasks.loop that drains the shared packet queue.
+    # Each connection has a persistent tasks.loop that drains its own packet queue.
     # Start it once -- starting an already-running loop raises RuntimeError, which
     # would otherwise blow up the second time get_server_data is invoked.
-    if not read_response.is_running():
-        read_response.start()
+    if conn.reader is None:
+        async def _tick():
+            await read_response(conn)
+        conn.reader = tasks.loop(seconds=1)(_tick)
+    if not conn.reader.is_running():
+        conn.reader.start()
 
     # Prefer a plaintext (ws://) connection, but fall back to TLS (wss://) when the
     # server speaks TLS to our handshake (raising InvalidMessage: "did not receive a
@@ -443,15 +461,15 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
                 async with websockets.connect(uri) as websocket:
                     log.info("Connected to %s, slot %s", uri, slot_name)
                     schemes = [scheme]  # pin the working scheme for any reconnects
-                    is_websocket_connected = True
+                    conn.is_websocket_connected = True
                     # Send initial connection payload
-                    await send_connect_packet(websocket, slot_name, password)
+                    await send_connect_packet(conn, websocket, slot_name, password)
 
                     # Run tasks concurrently; these stop when the connection closes.
                     await asyncio.gather(
-                        handle_messages(discord_ack, websocket),
+                        handle_messages(conn, discord_ack, websocket),
                         send_hello(websocket),
-                        check_connection(websocket, slot_name, password)
+                        check_connection(conn, websocket, slot_name, password)
                     )
                 # The session ended (socket closed); stop trying other schemes.
                 connection_error = None
@@ -464,7 +482,7 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
                 continue
             except websockets.ConnectionClosed:
                 log.info("Archipelago connection closed")
-                is_websocket_connected = False
+                conn.is_websocket_connected = False
                 connection_error = None
                 break
             except Exception as e:
@@ -472,7 +490,7 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
                 connection_error = e
                 continue
 
-        is_websocket_connected = False
+        conn.is_websocket_connected = False
 
         if connection_error is not None:
             # Every scheme failed to establish a connection.
@@ -482,7 +500,7 @@ async def main(discord_ack, address="archipelago.gg:38281", slot_name="island_bo
             break
 
         # The connection closed cleanly. Reconnect only if it was requested.
-        if not auto_reconnect:
+        if not conn.auto_reconnect:
             break
 
         log.info("Reconnecting in 5 seconds")

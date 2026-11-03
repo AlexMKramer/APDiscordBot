@@ -126,6 +126,11 @@ def install_apworlds(apworlds_src: str, ap_path: str) -> tuple[list[str], list[s
         for name in os.listdir(shadowed):
             shutil.move(os.path.join(shadowed, name), os.path.join(worlds_dir, name))
 
+    # ... and only the current apworlds: files left in custom_worlds/ by an earlier set would still load.
+    for fn in os.listdir(target):
+        if fn.endswith(".apworld"):
+            os.remove(os.path.join(target, fn))
+
     staged = []
     if os.path.isdir(apworlds_src):
         for fn in os.listdir(apworlds_src):

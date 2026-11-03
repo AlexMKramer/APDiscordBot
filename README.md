@@ -80,3 +80,7 @@ To assign a slot to your username, type "/assign_slot" and select your slot name
 With slots assigned, you can run "/get_all_tracked_items" and it will send you all items you have received for the slots you have assigned yourself.
 
 You can also run "/track_item" select the Game its for, the item name, an assigned slot, and the target amount you need.  You will then get a DM every time another one of those items is received, up to the amount you specified. 
+
+### More than one run
+One bot can follow several runs at once, each with its own channel, tracker and go-mode seed. The server owner adds a
+run with `/link_run` in that run's channel; see [docs/RUNS.md](docs/RUNS.md).

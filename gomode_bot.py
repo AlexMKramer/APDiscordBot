@@ -20,6 +20,7 @@ import asyncio
 import datetime
 import json
 import os
+import runs
 import sys
 
 import log_setup
@@ -45,8 +46,12 @@ AP_REPO = os.getenv("GOMODE_AP_REPO")
 RUNTIME_DIR = os.getenv("GOMODE_RUNTIME_DIR", os.path.join(ANALYZER_DIR, "runtime"))
 
 DATA_DIR = "data"
-REGISTRY_PATH = os.path.join(DATA_DIR, "registered_seed.json")
-CACHE_PATH = os.path.join(RUNTIME_DIR, "seed_cache.json")
+
+
+def _rk(run):
+    """Keyword arguments that hand a run on. Nothing for the single-run setup, so those calls
+    look exactly as they always did."""
+    return {"run": run} if run is not None else {}
 
 
 def is_configured() -> tuple[bool, str]:
@@ -81,7 +86,26 @@ def _quiet_remove(path: str) -> None:
         pass
 
 
-async def register_seed(seed_zip: str, *, progress=None) -> dict:
+def apworlds_source(run=None) -> tuple[str, str]:
+    """(folder, description) of the apworlds to provision for a run. A linked run uses the folder
+    named after it (its name, else its id) inside GOMODE_APWORLDS_DIR when there is one, so two
+    runs can hold different versions of a world; otherwise the shared GOMODE_APWORLDS_DIR."""
+    if run is not None:
+        for cand in (run.name, run.id):
+            if cand and cand not in (".", "..") and os.path.basename(cand) == cand:
+                folder = os.path.join(APWORLDS_DIR, cand)
+                if os.path.isdir(folder):
+                    return folder, f"the folder {cand!r} in the apworlds directory"
+    return APWORLDS_DIR, "the shared apworlds directory"
+
+
+def runtime_dir_for(run=None) -> str:
+    """Where a run's Archipelago tree and manifest live: its own folder under the runtime directory.
+    The single-run setup (no registry) keeps using the runtime directory itself."""
+    return os.path.join(RUNTIME_DIR, run.id) if run is not None else RUNTIME_DIR
+
+
+async def register_seed(seed_zip: str, *, progress=None, run=None) -> dict:
     """Provision a pinned AP env for `seed_zip` and precompute every slot's requirements.
 
     Writes the registry + per-slot cache and returns a summary dict. `progress` is an
@@ -97,13 +121,15 @@ async def register_seed(seed_zip: str, *, progress=None) -> dict:
     if not os.path.isfile(seed_zip):
         raise RuntimeError(f"Seed file not found: {seed_zip}")
 
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    runtime = runtime_dir_for(run)
+    apworlds, apworlds_from = apworlds_source(run)
+    os.makedirs(runtime, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
 
     # 1. Provision the matching AP source + the host's apworlds (plain Python: no AP import).
     await say("Provisioning the matching Archipelago version (this can take a minute)...")
     cmd = [sys.executable, os.path.join(ANALYZER_DIR, "provision.py"),
-           "--seed-zip", seed_zip, "--runtime-dir", RUNTIME_DIR, "--apworlds", APWORLDS_DIR]
+           "--seed-zip", seed_zip, "--runtime-dir", runtime, "--apworlds", apworlds]
     if AP_REPO:
         cmd += ["--ap-repo", AP_REPO]
     rc, out, err = await _run(cmd)
@@ -112,14 +138,14 @@ async def register_seed(seed_zip: str, *, progress=None) -> dict:
     manifest = json.loads(out)
     ap_path, version = manifest["ap_path"], manifest["version"]
     await say(f"Provisioned Archipelago {version} with {len(manifest['apworlds_installed'])} "
-              "apworlds. Analyzing every slot's go-mode requirements -- this is a one-time "
+              f"apworlds{f' from {apworlds_from}' if run is not None else ''}. Analyzing every slot's go-mode requirements -- this is a one-time "
               "step and may take a few minutes...")
 
     # 2. Precompute the requirement tree (or conservative fallback) for every slot. Needs
     #    the AP env, so use the configured AP interpreter. Write to a TEMP cache and only
     #    swap it into place once the run is known-good, so a failed re-registration can't
     #    truncate the live cache and silently break the previously-registered seed.
-    tmp_cache = CACHE_PATH + ".tmp"
+    tmp_cache = runs.seed_cache_path(run) + ".tmp"
     cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "precompute.py"),
            "--ap-path", ap_path, "--seed-zip", seed_zip, "--out", tmp_cache]
     rc, out, err = await _run(cmd)
@@ -131,7 +157,7 @@ async def register_seed(seed_zip: str, *, progress=None) -> dict:
     except (ValueError, IndexError) as exc:
         _quiet_remove(tmp_cache)
         raise RuntimeError(f"Precompute produced no valid summary: {exc}\n{(out or err)[-800:]}")
-    os.replace(tmp_cache, CACHE_PATH)  # atomic adopt of the new, validated cache
+    os.replace(tmp_cache, runs.seed_cache_path(run))  # atomic adopt of the new, validated cache
 
     # 3. Record the active seed (atomically too). Only one seed is registered at a time.
     registry = {
@@ -142,30 +168,30 @@ async def register_seed(seed_zip: str, *, progress=None) -> dict:
         "exact": summary.get("exact", 0),
         "unsupported": summary["unsupported"],
         "unsupported_slots": summary.get("unsupported_slots", []),
-        "cache_path": os.path.abspath(CACHE_PATH),
+        "cache_path": os.path.abspath(runs.seed_cache_path(run)),
         "ap_path": ap_path,
         "seed_zip": os.path.abspath(seed_zip),
         "registered_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
-    tmp_reg = REGISTRY_PATH + ".tmp"
+    tmp_reg = runs.run_path("registered_seed.json", run) + ".tmp"
     with open(tmp_reg, "w", encoding="utf-8") as fh:
         json.dump(registry, fh, indent=2)
-    os.replace(tmp_reg, REGISTRY_PATH)
+    os.replace(tmp_reg, runs.run_path("registered_seed.json", run))
     return registry
 
 
-def load_registry() -> dict | None:
+def load_registry(run=None) -> dict | None:
     try:
-        with open(REGISTRY_PATH, encoding="utf-8") as fh:
+        with open(runs.run_path("registered_seed.json", run), encoding="utf-8") as fh:
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
 
-def load_cache() -> dict | None:
+def load_cache(run=None) -> dict | None:
     """The precomputed per-slot requirements for the active seed, or None if unregistered."""
-    reg = load_registry()
-    path = reg["cache_path"] if reg else CACHE_PATH
+    reg = load_registry(**_rk(run))
+    path = reg["cache_path"] if reg else runs.seed_cache_path(run)
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
@@ -185,9 +211,9 @@ def slot_for_name(cache: dict, slot_name: str) -> dict | None:
 
 # --- player-facing: go-mode status + on-demand analysis ---------------------
 
-def _load_items_received() -> dict:
+def _load_items_received(run=None) -> dict:
     try:
-        with open(os.path.join(DATA_DIR, "items_received.json"), encoding="utf-8") as fh:
+        with open(runs.run_path("items_received.json", run), encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, json.JSONDecodeError):
         return {}
@@ -197,11 +223,12 @@ _go_mode_seen: dict = {}
 _checks_seen: dict = {}
 
 
-def _log_change(memo: dict, name: str, value, logger, text: str, *args) -> None:
+def _log_change(memo: dict, name: str, value, logger, text: str, *args, run=None) -> None:
     """Log a result the first time it is seen and whenever it changes (the loops repeat it every minute)."""
-    if memo.get(name) != value:
-        memo[name] = value
-        logger.info(text, *args)
+    key = (run.id, name) if run is not None else name
+    if memo.get(key) != value:
+        memo[key] = value
+        logger.info(text if run is None else "[" + run.name + "] " + text, *args)
 
 
 def _why(st: dict) -> str:
@@ -247,9 +274,9 @@ def inventory_for_slot(items_received: dict, slot_name: str) -> dict:
     return {}
 
 
-def current_inventory(slot_name: str) -> dict:
+def current_inventory(slot_name: str, run=None) -> dict:
     """The slot's current {item_name: count} from items_received.json on disk."""
-    return inventory_for_slot(_load_items_received(), slot_name)
+    return inventory_for_slot(_load_items_received(**_rk(run)), slot_name)
 
 
 def _tracker_game_for_slot(items_received: dict, slot_name: str):
@@ -275,7 +302,8 @@ class WorkerError(RuntimeError):
 
 
 class _Worker:
-    def __init__(self):
+    def __init__(self, run=None):
+        self.run = run       # the run this analyzer serves; None for the single-run (no registry) setup
         self.proc = None
         self.key = None      # (seed, ap_path, seed_zip) the running worker was started for
         self.log = None
@@ -295,9 +323,12 @@ class _Worker:
             self.log = None
 
     async def _start(self, reg: dict):
-        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        log_path = WORKER_LOG
+        if self.run is not None:
+            log_path = os.path.join(RUNTIME_DIR, self.run.id, "worker.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
         # stderr to a file: Archipelago's chatter would otherwise fill the pipe and stall it.
-        self.log = open(WORKER_LOG, "a", encoding="utf-8")
+        self.log = open(log_path, "a", encoding="utf-8")
         self.proc = await asyncio.create_subprocess_exec(
             AP_PYTHON, os.path.join(ANALYZER_DIR, "worker.py"),
             "--ap-path", reg["ap_path"], "--seed-zip", reg["seed_zip"],
@@ -313,7 +344,7 @@ class _Worker:
                                     ready.get('seed'), ready.get('built'), ready.get('slots'), ready.get('seconds'))
 
     async def request(self, op: str, **payload):
-        reg = load_registry()
+        reg = load_registry(**_rk(self.run))
         if not reg:
             raise RuntimeError("no seed registered")
         key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"))
@@ -345,31 +376,50 @@ class _Worker:
                 return reply["result"]
 
 
-_worker = _Worker()
+_worker = _Worker()          # the single-run (no registry) analyzer
+_workers: dict = {}          # run id -> that run's analyzer, created the first time it is asked for
 
 
-async def warm_worker() -> None:
+def worker_for(run=None) -> "_Worker":
+    """The analyzer of this run (run=None: the only run, or the single-run one with no registry).
+    Made on first use, so a run with no registered seed never starts a subprocess."""
+    run = run or runs.default_run()
+    if run is None:
+        return _worker
+    if run.id not in _workers:
+        _workers[run.id] = _Worker(run)
+    return _workers[run.id]
+
+
+async def stop_worker(run) -> None:
+    """Stop and forget one run's analyzer (the run was unlinked)."""
+    worker = _workers.pop(run.id, None)
+    if worker:
+        await worker._stop()
+
+
+async def warm_worker(run=None) -> None:
     """Start the analyzer for the registered seed ahead of the first query (bot startup)."""
-    if load_registry() is None:
+    if load_registry(**_rk(run)) is None:
         return
     try:
-        await _worker.request("ping")
+        await worker_for(run).request("ping")
     except Exception as e:  # noqa: BLE001 -- a later query will retry
         log_error.exception("Go-mode analyzer could not start: %s", e)
 
 
-async def go_mode_status(slot_names, *, items_received: dict | None = None) -> dict:
+async def go_mode_status(slot_names, *, items_received: dict | None = None, run=None) -> dict:
     """For each assigned slot name, return {status, in_go_mode, game, reason?}.
 
     Every supported slot is checked the way Universal Tracker does it: against its rebuilt
     world's real logic, in one request to the analyzer. Unsupported/unregistered slots are
     reported as such (in_go_mode = None).
     """
-    cache, reg = load_cache(), load_registry()
+    cache, reg = load_cache(**_rk(run)), load_registry(**_rk(run))
     if not cache or not reg:
         return {name: {"status": "unregistered", "in_go_mode": None} for name in slot_names}
     if items_received is None:
-        items_received = _load_items_received()
+        items_received = _load_items_received(**_rk(run))
 
     result: dict = {}
     batch: dict = {}
@@ -397,7 +447,7 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
 
     if batch:
         try:
-            oracle = await _worker.request("go_mode", slots=batch)
+            oracle = await worker_for(run).request("go_mode", slots=batch)
         except Exception as e:  # noqa: BLE001 -- leave in_go_mode None; the next cycle retries
             log_error.exception("Go-mode analyzer request failed, will retry next cycle: %s", e)
             oracle = {}
@@ -409,17 +459,17 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None) -> d
                     result[name]["reason"] = info.get("reason", "")
     for name, st in result.items():
         _log_change(_go_mode_seen, name, (st.get("status"), st.get("in_go_mode")), log_goal,
-                    "Go mode for %s (%s): %s", name, st.get("game") or "unknown game", _go_mode_words(st))
+                    "Go mode for %s (%s): %s", name, st.get("game") or "unknown game", _go_mode_words(st), run=run)
     return result
 
 
-async def analyze_slot_live(slot_name: str, inventory: dict) -> dict | None:
+async def analyze_slot_live(slot_name: str, inventory: dict, run=None) -> dict | None:
     """Full on-demand analysis of one slot for the player's current inventory. Returns the
     analysis dict (incl. `requirements_text`), or None if no seed is registered."""
-    if load_registry() is None:
+    if load_registry(**_rk(run)) is None:
         return None
     try:
-        return await _worker.request("analyze", slot=slot_name, inventory=inventory)
+        return await worker_for(run).request("analyze", slot=slot_name, inventory=inventory)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "reason": str(e)[-500:]}
 
@@ -433,17 +483,17 @@ def checked_for_slot(items_received: dict, slot_name: str) -> list:
 
 
 async def checks_in_logic(slot_names, *, items_received: dict | None = None,
-                          list_names: bool = False) -> dict:
+                          list_names: bool = False, run=None) -> dict:
     """For each slot name, {status, game, reason?} plus, when ok, {in_logic, in_logic_done,
     total, done}: its checks reachable with what the player holds (as UT counts them) and how
     many of those are done, and all its checks and how many are done. With list_names, also
     "to_do": the names of the in-logic checks not done yet. One analyzer request for every
     supported slot."""
-    cache, reg = load_cache(), load_registry()
+    cache, reg = load_cache(**_rk(run)), load_registry(**_rk(run))
     if not cache or not reg:
         return {name: {"status": "unregistered"} for name in slot_names}
     if items_received is None:
-        items_received = _load_items_received()
+        items_received = _load_items_received(**_rk(run))
 
     result: dict = {}
     batch: dict = {}
@@ -472,7 +522,7 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None,
 
     if batch:
         try:
-            checks = await _worker.request("checks", slots=batch)
+            checks = await worker_for(run).request("checks", slots=batch)
         except Exception as e:  # noqa: BLE001 -- slots stay "couldn't check right now"
             log_error.exception("Checks analyzer request failed: %s", e)
             checks = {}
@@ -485,16 +535,16 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None,
         else:
             words = f"not checked ({_why(st)})"
         _log_change(_checks_seen, name, words, log_checks, "Checks for %s (%s): %s",
-                    name, st.get("game") or "unknown game", words)
+                    name, st.get("game") or "unknown game", words, run=run)
     return result
 
 
 async def most_useful_items(slot_name: str, *, items_received: dict | None = None,
-                            top: int = 5) -> dict:
+                            top: int = 5, run=None) -> dict:
     """{status, game, items?: [{"name", "opens"}], reason?}: the missing items that would each
     open the most new checks for the slot right now."""
-    cache = load_cache()
-    if not cache or load_registry() is None:
+    cache = load_cache(**_rk(run))
+    if not cache or load_registry(**_rk(run)) is None:
         return {"status": "unregistered"}
     rec = slot_for_name(cache, slot_name)
     if rec is None:
@@ -503,12 +553,12 @@ async def most_useful_items(slot_name: str, *, items_received: dict | None = Non
     if rec.get("status") != "ok":
         return {"status": rec.get("status", "error"), "game": game, "reason": rec.get("reason", "")}
     if items_received is None:
-        items_received = _load_items_received()
+        items_received = _load_items_received(**_rk(run))
     tracker_game = _tracker_game_for_slot(items_received, slot_name)
     if tracker_game and game and tracker_game.lower() != str(game).lower():
         return {"status": "tracker_mismatch", "game": game}
     try:
-        reply = await _worker.request("useful_items", slot=rec.get("name", slot_name), top=top,
+        reply = await worker_for(run).request("useful_items", slot=rec.get("name", slot_name), top=top,
                                       inventory=inventory_for_slot(items_received, slot_name),
                                       checked=checked_for_slot(items_received, slot_name))
     except Exception as e:  # noqa: BLE001
@@ -524,26 +574,27 @@ async def most_useful_items(slot_name: str, *, items_received: dict | None = Non
 _item_flags_memo: dict = {}   # {seed: {slot_name: {"game", "items": {name: flags}}} or None}
 
 
-async def load_item_flags() -> dict | None:
+async def load_item_flags(run=None) -> dict | None:
     """Every slot's {item name: flags} for the registered seed, or None if unavailable."""
-    reg = load_registry()
+    reg = load_registry(**_rk(run))
     if not reg:
         return None
     seed = reg.get("seed")
-    if seed in _item_flags_memo:
-        return _item_flags_memo[seed]
+    memo_key = (run.id if run is not None else None, seed)
+    if memo_key in _item_flags_memo:
+        return _item_flags_memo[memo_key]
     try:
-        result = await _worker.request("item_flags")
+        result = await worker_for(run).request("item_flags")
     except Exception as e:  # noqa: BLE001
         result = None
         log_error.exception("Could not read item classifications: %s", e)
     if not result or result.get("seed") != seed:
         # Remembered for this run so a broken setup doesn't retry every minute; registering a
         # seed (a new seed key) tries again.
-        _item_flags_memo[seed] = None
+        _item_flags_memo[memo_key] = None
         return None
-    _item_flags_memo[seed] = result["item_flags"]
-    return _item_flags_memo[seed]
+    _item_flags_memo[memo_key] = result["item_flags"]
+    return _item_flags_memo[memo_key]
 
 
 def drop_filler(diff: dict, item_flags: dict, items_received: dict) -> dict:
@@ -570,13 +621,12 @@ def drop_filler(diff: dict, item_flags: dict, items_received: dict) -> dict:
 
 # --- go-mode notification dedup state (per registered seed) ------------------
 
-NOTIFIED_PATH = os.path.join(DATA_DIR, "go_mode_notified.json")
 
 
-def load_notified(current_seed: str) -> set:
+def load_notified(current_seed: str, run=None) -> set:
     """Slot names already DM'd for the CURRENT seed. Auto-resets when the seed changes."""
     try:
-        with open(NOTIFIED_PATH, encoding="utf-8") as fh:
+        with open(runs.run_path("go_mode_notified.json", run), encoding="utf-8") as fh:
             data = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
@@ -585,18 +635,16 @@ def load_notified(current_seed: str) -> set:
     return set(data.get("notified", []))
 
 
-def save_notified(current_seed: str, notified) -> None:
+def save_notified(current_seed: str, notified, run=None) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = NOTIFIED_PATH + ".tmp"
+    tmp = runs.run_path("go_mode_notified.json", run) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump({"seed": current_seed, "notified": sorted(notified)}, fh, indent=2)
-    os.replace(tmp, NOTIFIED_PATH)
+    os.replace(tmp, runs.run_path("go_mode_notified.json", run))
 
 
 # --- unstuck alerts (opt-in, per player and slot) ----------------------------
 
-UNSTUCK_SUBS_PATH = os.path.join(DATA_DIR, "unstuck_alerts.json")
-UNSTUCK_STATE_PATH = os.path.join(DATA_DIR, "unstuck_state.json")
 
 
 def _write_json(path: str, data) -> None:
@@ -607,29 +655,29 @@ def _write_json(path: str, data) -> None:
     os.replace(tmp, path)
 
 
-def load_unstuck_subscriptions() -> dict:
+def load_unstuck_subscriptions(run=None) -> dict:
     """{discord user id: [slot names]} of players who signed up for unstuck alerts."""
     try:
-        with open(UNSTUCK_SUBS_PATH, encoding="utf-8") as fh:
+        with open(runs.run_path("unstuck_alerts.json", run), encoding="utf-8") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def save_unstuck_subscriptions(subs: dict) -> None:
-    _write_json(UNSTUCK_SUBS_PATH, {user: sorted(set(names)) for user, names in subs.items() if names})
+def save_unstuck_subscriptions(subs: dict, run=None) -> None:
+    _write_json(runs.run_path("unstuck_alerts.json", run), {user: sorted(set(names)) for user, names in subs.items() if names})
 
 
-def load_unstuck_state(current_seed: str) -> dict:
+def load_unstuck_state(current_seed: str, run=None) -> dict:
     """{slot name: {"to_do": int, "inventory": {...}}} last seen for the CURRENT seed."""
     try:
-        with open(UNSTUCK_STATE_PATH, encoding="utf-8") as fh:
+        with open(runs.run_path("unstuck_state.json", run), encoding="utf-8") as fh:
             data = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
     return data.get("slots", {}) if data.get("seed") == current_seed else {}
 
 
-def save_unstuck_state(current_seed: str, slots: dict) -> None:
-    _write_json(UNSTUCK_STATE_PATH, {"seed": current_seed, "slots": slots})
+def save_unstuck_state(current_seed: str, slots: dict, run=None) -> None:
+    _write_json(runs.run_path("unstuck_state.json", run), {"seed": current_seed, "slots": slots})
