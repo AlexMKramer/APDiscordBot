@@ -246,6 +246,7 @@ class PreparedSlot:
     prog_names: set         # names that are progression somewhere in the universe
     templates: dict         # item name -> an Item the rebuild made, for worlds without create_item
     made: dict = field(default_factory=dict)  # item name -> the Item inventory_state copies from
+    open_goal: bool = False  # the goal is reachable with no items at all (needs an exact rebuild to trust)
 
 
 def _make_item(world, name: str, templates: dict):
@@ -282,11 +283,17 @@ def _finish(multiworld, world_type, precollected, pre_filled: bool = False):
     multiworld.precollected_items[player] = [it for it in multiworld.precollected_items[player]
                                              if it.code is None]
 
-    # Guardrail 1: the world must define a real goal. The default completion_condition
-    # is `lambda state: True`; if an empty state already "beats" the game, the goal was
-    # never set (or this world needs setup we skipped), so we must not claim go-mode.
-    if multiworld.can_beat_game(CollectionState(multiworld)):
+    # Guardrail 1: the world must define a real goal. The default completion_condition is
+    # `lambda state: True`, so it holds on a bare state with nothing collected and nothing swept;
+    # that means the goal was never set (or this world needs setup we skipped), and we must not
+    # claim go-mode. A real goal is false on the bare state. It may still be reachable from the
+    # start once the world's locked events are swept (a Victory event in a location with no
+    # requirements). That is a legitimate slot that is simply already in go-mode, but it is also
+    # what a rebuild that skipped some setup looks like, so it is only trusted when the caller has
+    # checked the rebuild against the seed (see `open_goal` and prepare_slot).
+    if multiworld.completion_condition[player](CollectionState(multiworld)):
         return None, "World has no gating goal in logic (cannot determine go-mode reliably)."
+    open_goal = bool(multiworld.can_beat_game(CollectionState(multiworld)))
 
     # Everything the player can ever hold: the item pool plus their start inventory (the
     # world's own start items, plus yaml/randomized start inventory from the multidata).
@@ -345,7 +352,8 @@ def _finish(multiworld, world_type, precollected, pre_filled: bool = False):
                           "reconstruction is incomplete.")
 
     return PreparedSlot(multiworld=multiworld, world_type=world_type, universe=universe,
-                        prog_names={item.name for item in universe}, templates=templates), ""
+                        prog_names={item.name for item in universe}, templates=templates,
+                        open_goal=open_goal), ""
 
 
 def _run_pre_fill(multiworld, world) -> bool:
@@ -491,6 +499,12 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
                 break
             mismatch = (_mismatch(prepared.multiworld, expected_locations or set(),
                                   expected_prog or Counter()) if checkable else None)
+            if prepared.open_goal and not (checkable and mismatch == 0):
+                # Reachable with no items: either a real goal with nothing in its way, or a rebuild that
+                # skipped some setup. Only an exact match against the seed tells them apart.
+                failures.append(f"{label}: The goal is reachable with no items, but the rebuild could not be "
+                                "verified against the seed, so go-mode is not claimed.")
+                break
             tag = label if how == "none" or label == "seed" else f"{label}({how})"
             if best is None or (mismatch is not None and mismatch < best[0]):
                 best = (mismatch, prepared, tag, source)
@@ -499,8 +513,11 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
             break  # an exact match (or nothing to check against): take it
 
     if best is None:
-        # Nothing built past the guardrails. Report the most faithful attempt's reason.
-        reason = failures[0] if failures else "no rebuild succeeded"
+        # Nothing built past the guardrails. Report the most faithful attempt's reason, except that a
+        # world which only sets its goal in pre_fill always trips "no gating goal" on the attempts that
+        # skip pre_fill; that says nothing about why the later attempts failed, so skip past it.
+        real = [f for f in failures if "no gating goal" not in f]
+        reason = (real or failures or ["no rebuild succeeded"])[0]
         result.status = "error" if "Error" in reason or "Exception" in reason else "unsupported"
         result.reason = reason.split(": ", 1)[1] if ": " in reason else reason
         return None, result
