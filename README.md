@@ -1,86 +1,49 @@
 # APDiscordBot
-This is a Python based Discord Bot for interacting with an Archipelago Multiworld server.
 
-The bot will announce items received to a specific channel within seconds of them showing up on the tracker (it reads the tracker every 10 seconds; set `FEED_POLL_SECONDS` to change that), can be used to get a list of all of the items received for a specific slot or a list of slots that you assign to yourself, and can even be used to track specific items for a slot to get a DM when you receive it.
+A self-hosted Discord bot for an Archipelago multiworld. It posts new items to a channel within seconds, DMs players the items they received, and can tell them what they still need to reach their goal.
 
-## Setup
+## What you need
+- A computer or server that stays on, with Docker and Docker Compose (or Python 3.12 if you skip Docker).
+- A Discord account to create the bot application.
+- An Archipelago WebHost room tracker URL (for example `https://your-host/tracker/<room-id>`).
+- The Archipelago server address, and a slot for the bot (see [Use](#use)).
 
-1. Clone the repo and change into the directory.
+## Install
+1. Clone the repo and open the folder: `git clone https://github.com/AlexMKramer/APDiscordBot.git`, then `cd APDiscordBot`.
+2. Copy the template: `cp .env_template .env`.
+3. Open the [Discord Developer Portal](https://discord.com/developers/applications) and create a New Application.
+4. Under Bot, copy the token. Put it in `.env` as `DISCORD_TOKEN`.
+5. Under OAuth2 > URL Generator, tick `bot` and `applications.commands`. Under Bot Permissions tick Send Messages and Manage Messages (the second lets the bot pin the hints list).
+6. Open the invite URL it shows and add the bot to your Discord server.
+7. Fill in `TRACKER_URL` in `.env`. Add `DISCORD_CHANNEL_ID` for the item feed channel. All options are in [docs/CONFIG.md](docs/CONFIG.md).
+8. Start it: `docker compose up -d --build`.
 
-```
-git clone https://github.com/AlexMKramer/APDiscordBot.git
+## Use
+First-time setup, in Discord:
+1. `/get_server_data` with the server address and port, the bot's slot name, and the password if the slot has one. Needed once.
+2. `/assign_slot` to link your Discord account to your slot.
 
-cd APDiscordBot
-```
-2. Copy the .env_template to .env.
+Everyday commands:
+- `/get_new_items_for_slot` shows new items for one of your slots.
+- `/get_all_new_items` shows new items for all your slots.
+- `/get_items_for_slot` lists everything a slot has received.
+- `/track_item` sends a DM when a specific item arrives.
+- `/hint` asks the server for a hint on an item.
+- `/items_to_go_mode` shows what you still need to reach your goal (needs [go-mode](docs/GOMODE.md)).
 
-```
-cp .env_template .env
-```
-3. Go to the Discord Developer portal and select New Application and name it whatever you'd like.  https://discord.com/developers/applications
+Every command is listed in [docs/COMMANDS.md](docs/COMMANDS.md).
 
-4. Select OAuth2 on the left side of the screen, then under OAuth2 URL Generator, select bot, applications.commands, and Send Messages under bot permissions.
+One bot can follow several runs at once, each linked to its own channel: the server owner runs `/link_run` in that run's channel. See [docs/RUNS.md](docs/RUNS.md).
 
-5. Edit the .env and fill out each field.  Use your preferred editor, I use nano.
+## Logs
+The bot writes a log for each run to the console (`docker compose logs -f`) and to `data/logs/bot_<date>_<time>.log`, keeping the newest 10. Set `LOG_LEVEL=DEBUG` in `.env` for more detail; see [docs/LOGS.md](docs/LOGS.md).
 
-   If you don't enter a Channel ID, the bot will only send items that you are tracking in a DM when requested or when tracked items are received.
+## Known issues
+See the [issues page](https://github.com/AlexMKramer/APDiscordBot/issues).
 
-```
-nano .env
-```
-
-6. Save and exit.
-
-### Docker Compose
-I suggest running the app with Docker Compose, though it is not a requirement.
-
-With docker already installed, build the container and run it.
-
-```
-docker compose up --build
-```
-
-Once it finishes building, it will start to run.  Once you see it say its logged in as the bot name you set in the Discord Developer portal, stop the container with ctrl+c.  
-
-Run the container detatched.
-
-```
-docker compose up -d
-```
-
-## Discord
-When using the bot with a server for the first time, you will need to have it connect to the AP server to gather item and slot info.
-
-I recommend giving the bot its own "slot" for the server, though it is not a requirement.
-
-You can see an example of another project's YAML that you would provide to the server admin before AP generation here: https://github.com/Quasky/bridgeipelago/blob/main/bridgeipleago.yaml
-
-If you didn't set this up before generation, you can still use the bot, just provide it with a slot name that you have access to.
-
-### Getting the Server Data
-
-**You will only need to do this once.**
-
-
-With the bot running, type "/get_server_data" followed by the server address (with the port), the slot name, and the password (if the slot has one), and hit enter.
-
-```
-/get_server_data archipelago.gg:38281 APBot password
-```
-
-It will then connect to the server using that slot name, send a message to the server, get the packets it needs, and disconnect.  
-
-### Using Commands
-You can see all of the commands for the bot in Discord by typing "/" and selecting the bot on the left.
-
-Most commands are self explanatory, so I won't go over a majority of them.
-
-To assign a slot to your username, type "/assign_slot" and select your slot name from the list.  If it fails to list any slot names, restart the bot and try again.
-
-With slots assigned, you can run "/get_all_tracked_items" and it will send you all items you have received for the slots you have assigned yourself.
-
-You can also run "/track_item" select the Game its for, the item name, an assigned slot, and the target amount you need.  You will then get a DM every time another one of those items is received, up to the amount you specified. 
-
-### More than one run
-One bot can follow several runs at once, each with its own channel, tracker and go-mode seed. The server owner adds a
-run with `/link_run` in that run's channel; see [docs/RUNS.md](docs/RUNS.md).
+## More
+- [Commands](docs/COMMANDS.md)
+- [Configuration (.env)](docs/CONFIG.md)
+- [Go-mode, checks in logic and registering a seed](docs/GOMODE.md)
+- [Several runs in one bot](docs/RUNS.md)
+- [Developing](docs/DEVELOPING.md)
