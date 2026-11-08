@@ -31,12 +31,16 @@ no restart.
 Then, in the same channel, as for a single run: `/get_server_data` (once), `/register_seed` (for go-mode), and
 players use `/assign_slot`.
 
-`/unlink_run` (in the run's channel) stops the run: it stops posting and tracking, and is marked inactive. Its data
+`/unlink_run` (in the run's channel, or `/unlink_run name:Autumn` from any channel) stops the run: it stops posting and tracking, and is marked inactive. Its data
 stays in `data/runs/<run>/`. Running `/link_run` again with the same tracker URL restores the run with its
 assignments, items and seed.
 
 `/list_runs` shows every run: name, channel, tracker, server address, whether it is active and whether a seed is
 registered.
+
+If a run's channel is deleted, the bot keeps running and logs one line per run saying the channel no longer exists, and
+posts nothing for it. It does not unlink the run on its own, because a channel can be unreadable for a while. `/list_runs`
+shows the channel as missing; `/unlink_run name:<run>` removes the run.
 
 ## Apworlds per run
 

@@ -154,6 +154,46 @@ def _outages(run):
     return _run_outages[run.id]
 
 
+# Runs whose missing channel is already logged (once, until the channel is back), by run key:
+# "missing" (not in Discord's cache) or "deleted" (Discord answered Unknown Channel for a send).
+_channel_gone_logged = {}
+
+
+def _note_channel_gone(channel_id, run=None, how="missing"):
+    """Log once per run that its channel no longer exists, and what to do about it."""
+    key = _run_key(run)
+    if key in _channel_gone_logged:
+        if how == "missing":
+            _channel_gone_logged[key] = how     # a "deleted" run that leaves the cache is cleared when it returns
+        return
+    _channel_gone_logged[key] = how
+    if run is not None:
+        log_config.error("The channel of run %r (%s) no longer exists, so nothing is posted for it. "
+                         "Use /unlink_run name:%s to remove the run.", run.name, channel_id, run.name)
+    else:
+        log_config.error("The feed channel (%s) no longer exists, so nothing is posted to it", channel_id)
+
+
+def _run_channel(channel_id, run=None):
+    """The run's channel for this cycle, or None (logged once) when it is gone. Not unlinked on its own:
+    a channel can be unreadable for a while."""
+    channel = bot.get_channel(int(channel_id)) if channel_id else None
+    if channel is not None:
+        if _channel_gone_logged.get(_run_key(run)) == "missing":
+            del _channel_gone_logged[_run_key(run)]
+    else:
+        _note_channel_gone(channel_id, run)
+    return channel
+
+
+def _channel_deleted(exc, channel_id, run=None) -> bool:
+    """True (after logging it once) when exc is Discord's "Unknown Channel" for a channel that was deleted."""
+    if isinstance(exc, discord.NotFound) and getattr(exc, "code", None) == 10003:
+        _note_channel_gone(channel_id, run, how="deleted")
+        return True
+    return False
+
+
 # The background tasks of each running run: run id ("" for the single-run setup) -> [asyncio tasks].
 _run_tasks = {}
 
@@ -186,8 +226,11 @@ def start_run(run=None):
     if not url:
         log_config.warning("No tracker URL%s, so there is no item feed", label)
     elif channel is None:
-        log_config.warning("Feed channel %s%s, so the tracker is read but nothing is posted to a channel",
-                           "not found" if channel_id else "not set", label)
+        if channel_id:
+            _note_channel_gone(channel_id, run)
+        else:
+            log_config.warning("Feed channel not set%s, so the tracker is read but nothing is posted to a channel",
+                               label)
         spawn(no_dm_tracker(url, auth, **_rk(run)))
     else:
         spawn(check_for_item_changes(url, auth, channel_id, **_rk(run)))
@@ -777,20 +820,38 @@ async def link_run(ctx, name: str, tracker_url: str, server_address: str = None)
         ephemeral=True)
 
 
-@bot.slash_command(description="(Owner) Stop tracking the run linked to this channel. Its data is kept.")
-async def unlink_run(ctx):
+async def run_name_autocomplete(ctx: discord.AutocompleteContext):
+    if str(ctx.interaction.user.id) != str(gomode_owner_id):
+        return []
+    value = (ctx.value or "").lower()
+    return [r.name for r in runs.active_runs() if r.name.lower().startswith(value)]
+
+
+@bot.slash_command(description="(Owner) Stop tracking a run, by name or the one linked to this channel. Its data is kept.")
+@option("name", description="The run to unlink; leave empty for this channel's run.", required=False,
+        autocomplete=run_name_autocomplete)
+async def unlink_run(ctx, name: str = None):
     if not is_owner(ctx):
         await ctx.respond("Only the server owner can unlink a run.", ephemeral=True)
         return
-    run = runs.run_for_ctx(ctx)
-    if run is None:
-        await ctx.respond("This channel is not linked to a run.", ephemeral=True)
-        return
+    name = (name or "").strip()
+    if name:
+        wanted = name.lower()
+        run = next((r for r in runs.active_runs() if wanted in (r.name.lower(), r.id.lower())), None)
+        if run is None:
+            await ctx.respond(f"There is no linked run called **{name}**. /list_runs shows them.", ephemeral=True)
+            return
+    else:
+        run = runs.run_for_ctx(ctx)
+        if run is None:
+            await ctx.respond("This channel is not linked to a run.", ephemeral=True)
+            return
     await stop_run(run)
     registry = runs.load_runs()
     if run.id in registry:
         registry[run.id].active = False
         runs.save_runs(registry)
+    _channel_gone_logged.pop(_run_key(run), None)
     log_start.info("Unlinked run %r from its channel; the data in data/runs/%s is kept", run.name, run.id)
     await ctx.respond(f"Unlinked **{run.name}**. It stops posting and tracking; its data is kept, and "
                       f"/link_run with the same tracker URL brings it back.", ephemeral=True)
@@ -808,8 +869,11 @@ async def list_runs(ctx):
     lines = []
     for run in registry.values():
         seed = "yes" if gomode_bot.load_registry(run=run) is not None else "no"
+        channel = f"<#{run.channel_id}>" if run.channel_id else "none"
+        if run.active and run.channel_id and bot.get_channel(int(run.channel_id)) is None:
+            channel += f" (missing: the channel no longer exists; /unlink_run name:{run.name})"
         lines.append(f"**{run.name}** ({'active' if run.active else 'unlinked'})\n"
-                     f"  channel: {f'<#{run.channel_id}>' if run.channel_id else 'none'}\n"
+                     f"  channel: {channel}\n"
                      f"  tracker: {run.tracker_url or 'none'}\n"
                      f"  server: {run.server_address or 'not set'}\n"
                      f"  seed registered: {seed}")
@@ -1761,7 +1825,7 @@ async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
     await bot.wait_until_ready()
     channel = bot.get_channel(int(channel_id))
     if channel is None:
-        log_config.error("Feed channel not found, the item feed is off")
+        _note_channel_gone(channel_id, run)
         return
 
     tracker_outage, feed_outage = _outages(run)
@@ -1793,9 +1857,11 @@ async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
                 wrapper_length = len("```\n") + len("\n```")
                 max_content_length = 1950 - wrapper_length
                 chunks = chunk_text_by_line(message, max_content_length)
-                for chunk in chunks:
+                channel = _run_channel(channel_id, run)
+                for chunk in (chunks if channel is not None else ()):
                     await channel.send(f"```ansi\n{chunk}\n```")
-                _log_announced(diff)
+                if channel is not None:
+                    _log_announced(diff)
                 quiet_cycles = 0
             else:
                 # Log a quiet spell about once every 5 minutes, not on every read.
@@ -1804,15 +1870,18 @@ async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
                     log_feed.info("No new items lately")
             feed_outage.ok()
         except Exception as e:
-            feed_outage.failed(e)
+            if not _channel_deleted(e, channel_id, run):
+                feed_outage.failed(e)
 
         # Keep the pinned unfound-hints message(s) current (None: no hint data this run).
         try:
+            channel = _run_channel(channel_id, run)
             hints = tracker_download.load_hints(**_rk(run))
-            if hints is not None:
+            if hints is not None and channel is not None:
                 await hints_pin.sync(channel, hints, **_rk(run))
         except Exception as e:
-            log_error.exception("Pinned hints update failed, will retry next cycle: %s", e)
+            if not _channel_deleted(e, channel_id, run):
+                log_error.exception("Pinned hints update failed, will retry next cycle: %s", e)
 
         # Wait out the rest of the interval before reading again (see _next_poll_delay).
         await asyncio.sleep(_next_poll_delay(interval, time.monotonic() - started,
@@ -1865,7 +1934,7 @@ async def hourly_percentage_loop(channel_id, run=None):
     await bot.wait_until_ready()
     channel = bot.get_channel(int(channel_id))
     if channel is None:
-        log_config.error("Feed channel not found, skipping hourly percentage updates")
+        _note_channel_gone(channel_id, run)
         return
 
     while not bot.is_closed():
@@ -1873,9 +1942,12 @@ async def hourly_percentage_loop(channel_id, run=None):
         # Wrapped so a transient error (unreadable data file, Discord hiccup) is logged and
         # retried next hour instead of killing the loop until a full bot restart.
         try:
-            await _report_percentage_change(channel, **_rk(run))
+            channel = _run_channel(channel_id, run)
+            if channel is not None:
+                await _report_percentage_change(channel, **_rk(run))
         except Exception as e:
-            log_error.exception("Hourly percentage update failed, will retry next hour: %s", e)
+            if not _channel_deleted(e, channel_id, run):
+                log_error.exception("Hourly percentage update failed, will retry next hour: %s", e)
 
 
 async def _report_percentage_change(channel, run=None):

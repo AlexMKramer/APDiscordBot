@@ -9,8 +9,8 @@ Type `/` in Discord and pick the bot to see them. Slot name boxes suggest names 
 ## Runs
 Owner only. With more than one run, commands answer for the run linked to the channel they are typed in. See [RUNS.md](RUNS.md).
 - `/link_run name tracker_url [server_address]`: links a run to this channel.
-- `/unlink_run`: unlinks this channel's run. Its data is kept, and linking the same tracker again brings it back.
-- `/list_runs`: lists the linked runs and their channels.
+- `/unlink_run [name]`: unlinks this channel's run, or the run called `name` from any channel (the names are suggested as you type). Its data is kept, and linking the same tracker again brings it back.
+- `/list_runs`: lists the linked runs and their channels; a channel that was deleted is shown as missing.
 
 ## Items
 - `/get_items_for_slot slot_name`: DM with every item the slot has received.
