@@ -305,7 +305,7 @@ class _Worker:
     def __init__(self, run=None):
         self.run = run       # the run this analyzer serves; None for the single-run (no registry) setup
         self.proc = None
-        self.key = None      # (seed, ap_path, seed_zip) the running worker was started for
+        self.key = None      # (seed, ap_path, seed_zip, registered_at) the running worker was started for
         self.log = None
         self.lock = asyncio.Lock()
         self.next_id = 0
@@ -339,7 +339,7 @@ class _Worker:
         if not ready.get("ready"):
             await self._stop()
             raise RuntimeError(f"analyzer worker didn't start; see {WORKER_LOG}")
-        self.key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"))
+        self.key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"), reg.get("registered_at"))
         log_setup.get('start').info("Go-mode analyzer ready: seed %s, %s of %s slots built in %ss",
                                     ready.get('seed'), ready.get('built'), ready.get('slots'), ready.get('seconds'))
 
@@ -347,7 +347,7 @@ class _Worker:
         reg = load_registry(**_rk(self.run))
         if not reg:
             raise RuntimeError("no seed registered")
-        key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"))
+        key = (reg.get("seed"), reg.get("ap_path"), reg.get("seed_zip"), reg.get("registered_at"))
         async with self.lock:
             for attempt in (1, 2):
                 try:
