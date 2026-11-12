@@ -56,10 +56,12 @@ slashes, since Linux can't import it otherwise. The AP env still needs an
 interpreter with AP's runtime deps (PyYAML, schema, jellyfish, …); point the analyzer at
 one. A dedicated `--build-venv` step is a future addition; for now reuse an AP venv.
 
-**2. Analyze** a slot for a player's current inventory:
+**2. Analyze** a slot for a player's current inventory. Run the analyzer with `-O`, as the
+bot does: the released Archipelago generator runs with asserts off, and a few apworlds only
+load or build that way.
 
 ```
-<ap-venv-python> gomode_analyzer/cli.py \
+<ap-venv-python> -O gomode_analyzer/cli.py \
   --ap-path gomode_analyzer/runtime/ap-<version> \
   --seed-zip /path/AP_<seed>.zip \
   --slot "Alex_Crab" \

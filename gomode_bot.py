@@ -39,6 +39,11 @@ ANALYZER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gomode_
 # than letting precompute fail minutes later with an opaque ImportError.
 _AP_PYTHON_SET = os.getenv("GOMODE_AP_PYTHON") is not None
 AP_PYTHON = os.getenv("GOMODE_AP_PYTHON", sys.executable)
+# The analyzer runs with asserts off (-O), as the released Archipelago generator does. Some
+# apworlds trip an assert only a source run checks (a Choice with its own "random" option, an
+# item object added to the pool twice): the seed was made without that check, so the rebuild
+# must skip it too. It also skips a debug-only duplicate check over each world's item pool.
+AP_PYTHON_FLAGS = ["-O"]
 # The host's apworlds (placed on the bot server, e.g. via FTP) used to generate seeds.
 APWORLDS_DIR = os.getenv("GOMODE_APWORLDS_DIR")
 # Optional local AP git checkout for fast, offline provisioning (else download from GitHub).
@@ -296,7 +301,7 @@ async def register_seed(seed_zip: str, *, progress=None, run=None) -> dict:
     #    truncate the live cache and silently break the previously-registered seed.
     tmp_cache = runs.seed_cache_path(run) + ".tmp"
     #    Each slot's start and finish arrive as progress events while it runs.
-    cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "precompute.py"),
+    cmd = [AP_PYTHON, *AP_PYTHON_FLAGS, os.path.join(ANALYZER_DIR, "precompute.py"),
            "--ap-path", ap_path, "--seed-zip", seed_zip, "--out", tmp_cache,
            "--slot-timeout", f"{SLOT_TIMEOUT:g}", "--retry-timeout", f"{SLOT_RETRY_TIMEOUT:g}"]
     shown = _Progress(say)
@@ -490,7 +495,7 @@ class _Worker:
         # stderr to a file: Archipelago's chatter would otherwise fill the pipe and stall it.
         self.log = open(log_path, "a", encoding="utf-8")
         self.proc = await asyncio.create_subprocess_exec(
-            AP_PYTHON, os.path.join(ANALYZER_DIR, "worker.py"),
+            AP_PYTHON, *AP_PYTHON_FLAGS, os.path.join(ANALYZER_DIR, "worker.py"),
             "--ap-path", reg["ap_path"], "--seed-zip", reg["seed_zip"],
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=self.log,
             limit=64 * 1024 * 1024)

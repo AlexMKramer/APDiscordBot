@@ -43,6 +43,13 @@ import sys
 import threading
 import time
 
+
+def _child_flags() -> list:
+    """The interpreter flags the analysis worker is started with: the same optimize level as this
+    process (-O from the bot), so the worker also runs with asserts off, as the released generator does."""
+    return ["-" + "O" * sys.flags.optimize] if sys.flags.optimize else []
+
+
 DEFAULT_SLOT_TIMEOUT = 300.0
 DEFAULT_RETRY_TIMEOUT = 1800.0
 # Marks the worker's protocol lines on its stdout, so anything else a world prints there is ignored.
@@ -179,7 +186,7 @@ class _Supervisor:
         q.put(None)  # end of output: the worker has exited
 
     def _spawn(self, slots):
-        cmd = [sys.executable, os.path.abspath(__file__), "--worker",
+        cmd = [sys.executable, *_child_flags(), os.path.abspath(__file__), "--worker",
                "--ap-path", self.args.ap_path, "--seed-zip", self.args.seed_zip, "--out", self.args.out]
         if slots is not None:
             cmd += ["--slots", ",".join(str(s) for s in slots)]

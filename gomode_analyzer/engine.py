@@ -39,6 +39,15 @@ MAX_MINIMIZATION_ITEMS = 600
 # Decomposition is run once per slot (precomputed), so we allow large collect-everything
 # pools; this is just a backstop against a pathological case.
 MAX_CLASSIFY_ITEMS = 600
+# Cap on goal checks while discovering a requirement tree. Trees that verify take a few thousand;
+# a world whose goal can't be put as a tree (many interchangeable items behind costly rules, like
+# Plants vs. Zombies with tile unlocks) can take over a hundred thousand and still not verify. Past
+# the cap the slot gets the conservative split, as it would once the tree failed to verify.
+MAX_DISCOVER_CHECKS = 30000
+
+
+class _OverBudget(Exception):
+    pass
 
 
 @dataclass
@@ -109,6 +118,27 @@ def _make_option(option_cls, value, world_type=None, player_name: str = ""):
         except Exception:  # noqa: BLE001 -- an option that won't verify keeps its raw value
             pass
     return option
+
+
+def _usable_slot_data_options(world_type, options: dict) -> dict:
+    """The slot data's options that can be read back as the world's option of that name.
+
+    Some worlds write a value they worked out during generation under an option's name rather
+    than the option itself: Crab Champions puts the starting melee weapons it picked under
+    `starting_melee` (a Range), Rimworld the location count it raised past the option's maximum.
+    Such a value fails to build the option and would make the whole slot fall back to default
+    settings, so it is left out here and the spoiler's value for that option is used instead."""
+    hints = world_type.options_dataclass.type_hints
+    usable = {}
+    for key, value in options.items():
+        option_cls = hints.get(key)
+        if option_cls is not None:
+            try:
+                _make_option(option_cls, value)
+            except Exception:  # noqa: BLE001 -- not this option's value
+                continue
+        usable[key] = value
+    return usable
 
 
 def _settle(state) -> None:
@@ -472,13 +502,19 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
     # have different logic, and would silently answer with the wrong rules.
     if datapackage and not _same_datapackage(world_type, datapackage):
         result.status = "unsupported"
+        if not world_type.item_name_to_id and not world_type.location_name_to_id:
+            # Modded Minecraft makes all its items and locations from the player's settings while
+            # generating, so the installed world has none to compare and nothing to rebuild from.
+            result.reason = ("This world makes its items and locations from the player's settings during "
+                             "generation, and the seed doesn't keep what it needs to rebuild them.")
+            return None, result
         result.reason = ("The installed apworld doesn't match the one that generated this seed "
                          "(its item or location data differs). Install the same apworld version.")
         return None, result
 
     # Resolve options: spoiler-recovered as a base, slot_data overriding it (slot_data is
     # exact/typed; the spoiler is parsed from text). Anything still missing -> world default.
-    slot_data_opts = dict(options or {})
+    slot_data_opts = _usable_slot_data_options(world_type, options or {})
     spoiler_opts = spoiler_options.resolve_options(world_type, spoiler_settings or {})
     merged = {**spoiler_opts, **slot_data_opts}
 
@@ -790,8 +826,20 @@ def analyze_prepared(prepared: PreparedSlot, result: SlotResult, inventory: dict
     # provably reproduces the can_beat_game oracle on random item-sets.
     import requirements
     world = multiworld.worlds[1]
-    tree, verified = requirements.discover(multiworld.can_beat_game, current, remaining,
-                                           getattr(world, "item_name_groups", {}) or {})
+    checks = 0
+
+    def can_beat(state):
+        nonlocal checks
+        checks += 1
+        if checks > MAX_DISCOVER_CHECKS:
+            raise _OverBudget
+        return multiworld.can_beat_game(state)
+
+    try:
+        tree, verified = requirements.discover(can_beat, current, remaining,
+                                               getattr(world, "item_name_groups", {}) or {})
+    except _OverBudget:
+        tree, verified = None, False
     if verified and tree is not None:
         result.requirements = {"verified": True, "tree": tree}
     else:

@@ -719,7 +719,7 @@ async def register_seed(ctx, seed_file: discord.Attachment = None, server_path: 
         log_goal.info("Registered seed %s: %s slots, %s not supported", registry['seed'],
                       registry['slot_count'], registry['unsupported'])
         for slot in registry.get("unsupported_slots", []):
-            log_goal.info("%s (%s) is not supported: %s", slot['name'], slot['game'], str(slot['reason'])[:120])
+            log_goal.info("%s (%s) is not supported: %s", slot['name'], slot['game'], slot['reason'])
         summary = (
             f"**Registered seed `{registry['seed']}`** (Archipelago {registry['version']}).\n"
             f"- {registry['slot_count']} slots analyzed\n"
