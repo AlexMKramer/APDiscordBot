@@ -907,9 +907,12 @@ def _preferences_reply(run, notes=()) -> str:
 @option("useful_color", description="Hex colour for useful items, e.g. 6363E4. 'default' puts it back.", required=False)
 @option("trap_color", description="Hex colour for trap items, e.g. DE4040. 'default' puts it back.", required=False)
 @option("filler_color", description="Hex colour for filler items, e.g. 5BCEFA. 'default' puts it back.", required=False)
+@option("show_filler", description="Post filler items in the item thread too. Off (the default) hides them.",
+        required=False)
 @option("reset_all", description="Put every preference back to its default.", required=False)
 async def preferences_command(ctx, progression_color: str = None, useful_color: str = None,
-                              trap_color: str = None, filler_color: str = None, reset_all: bool = False):
+                              trap_color: str = None, filler_color: str = None, show_filler: bool = None,
+                              reset_all: bool = False):
     if not is_owner_or_admin(ctx):
         await ctx.respond("Only the bot owner or a server administrator can change preferences.", ephemeral=True)
         return
@@ -917,7 +920,7 @@ async def preferences_command(ctx, progression_color: str = None, useful_color: 
     if not ok:
         return
     asked = {"color_progression": progression_color, "color_useful": useful_color,
-             "color_trap": trap_color, "color_filler": filler_color}
+             "color_trap": trap_color, "color_filler": filler_color, "show_filler": show_filler}
     changes, problems = {}, []
     if reset_all:
         changes = {s.key: None for s in run_prefs.SETTINGS}
@@ -2038,8 +2041,11 @@ async def no_dm_tracker(tracker_url, auth, run=None):
 
 async def _hide_filler(diff, run=None):
     """The feed's diff without filler items, per the registered seed. Any problem getting the
-    classifications leaves the diff as it was, so the feed never goes quiet by mistake."""
+    classifications leaves the diff as it was, so the feed never goes quiet by mistake. A run that
+    turned on "show filler items" keeps everything."""
     try:
+        if run_prefs.get("show_filler", run):
+            return diff
         item_flags = await gomode_bot.load_item_flags(**_rk(run))
         if not item_flags:
             return diff
