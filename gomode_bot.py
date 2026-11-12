@@ -463,13 +463,13 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None, run=
     return result
 
 
-async def analyze_slot_live(slot_name: str, inventory: dict, run=None) -> dict | None:
+async def analyze_slot_live(slot_name: str, inventory: dict, colour: bool = False, run=None) -> dict | None:
     """Full on-demand analysis of one slot for the player's current inventory. Returns the
     analysis dict (incl. `requirements_text`), or None if no seed is registered."""
     if load_registry(**_rk(run)) is None:
         return None
     try:
-        return await worker_for(run).request("analyze", slot=slot_name, inventory=inventory)
+        return await worker_for(run).request("analyze", slot=slot_name, inventory=inventory, colour=colour)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "reason": str(e)[-500:]}
 
@@ -595,6 +595,17 @@ async def load_item_flags(run=None) -> dict | None:
         return None
     _item_flags_memo[memo_key] = result["item_flags"]
     return _item_flags_memo[memo_key]
+
+
+def slot_item_flags(item_flags, items_received, slot_name) -> dict:
+    """{item name: flags} for a slot, or {} when unknown or the tracker's game differs from the seed's."""
+    rec = (item_flags or {}).get(slot_name)
+    if not rec:
+        return {}
+    tracker_game = _tracker_game_for_slot(items_received, slot_name)
+    if tracker_game and tracker_game.lower() != str(rec.get("game", "")).lower():
+        return {}
+    return rec.get("items", {})
 
 
 def drop_filler(diff: dict, item_flags: dict, items_received: dict) -> dict:

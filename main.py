@@ -921,7 +921,7 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str, run=None):
     """Detailed 'what do I still need' for one slot, against current inventory."""
     rk = _rk(run)
     inventory = gomode_bot.current_inventory(slot_name, **rk)
-    res = await gomode_bot.analyze_slot_live(slot_name, inventory, **rk)
+    res = await gomode_bot.analyze_slot_live(slot_name, inventory, colour=True, **rk)
     if res is None:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
@@ -944,15 +944,20 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str, run=None):
         return
 
     lines = res.get("requirements_text") or ["(no requirement details available)"]
-    body = f"{header}\n" + "\n".join(lines)
-    if len(body) <= 1900:
-        await initial_response.edit_original_response(content=body)
+    # Item names carry ANSI colours, so the list goes in an ansi block (the header is inside it
+    # too, since Discord only renders colours there).
+    ansi_header = f"{ANSI_UNDERLINE}{slot_name}" + (f" ({game})" if game else "") + ANSI_RESET
+    body = ansi_header + "\n" + "\n".join(lines)
+    wrapper_length = len("```ansi\n") + len("\n```")
+    max_content_length = 1950 - wrapper_length
+    if len(body) <= max_content_length:
+        await initial_response.edit_original_response(content=f"```ansi\n{body}\n```")
         return
     # Long requirement trees: DM the full list, and only claim success if the DM actually sent
     # (catch HTTPException, not just Forbidden, so a rate-limit mid-stream can't escape).
     try:
-        for chunk in chunk_text_by_line(body, 1900):
-            await ctx.author.send(_dm_prefix(run) + chunk)
+        for chunk in chunk_text_by_line(body, max_content_length):
+            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
         await initial_response.edit_original_response(
             content=f"{header}\nThe list is long — I've sent it to you in a DM.")
     except discord.Forbidden:
@@ -1205,6 +1210,7 @@ async def most_useful_items(ctx, slot_name: str):
             content=f"**{slot_name}** isn't a slot in the registered seed.")
         return
 
+    use_ansi = False
     st = await gomode_bot.most_useful_items(name, top=10, **rk)
     game = st.get("game") or ""
     tag = f" ({game})" if game else ""
@@ -1213,13 +1219,16 @@ async def most_useful_items(ctx, slot_name: str):
     elif not st.get("items"):
         message = f"**{name}**{tag}: no single missing item opens new checks right now."
     else:
-        lines = [f"**Most useful items for {name}**{tag}:"]
+        flag_map = gomode_bot.slot_item_flags(await _item_flags_for(run), gomode_bot._load_items_received(**rk), name)
+        lines = [f"{ANSI_UNDERLINE}Most useful items for {name}{tag}:{ANSI_RESET}"]
         for rank, item in enumerate(st["items"], 1):
-            lines.append(f"{rank}. {item['name']} — opens {item['opens']} check{'s' if item['opens'] != 1 else ''}")
+            lines.append(f"{rank}. {colorize_item(item['name'], flag_map.get(item['name']))}"
+                         f" — opens {item['opens']} check{'s' if item['opens'] != 1 else ''}")
         message = "\n".join(lines)
+        use_ansi = True
     try:
-        for chunk in chunk_text_by_line(message, 1900):
-            await ctx.author.send(_dm_prefix(run) + chunk)
+        for chunk in chunk_text_by_line(message, 1950 - len("```ansi\n") - len("\n```") if use_ansi else 1900):
+            await ctx.author.send(_dm_prefix(run) + (f"```ansi\n{chunk}\n```" if use_ansi else chunk))
         await initial_response.edit_original_response(
             content=f"Sent you a DM with the most useful items for **{name}**.")
     except discord.Forbidden:
@@ -1459,6 +1468,7 @@ async def get_all_new_items(ctx):
     diff_message_lines = []
     updated = False
     assignments = listeners_data[author_id]
+    item_flags = await _item_flags_for(run)
 
     for assignment in assignments:
         slot_name = assignment.get("slot_name", "Unknown")
@@ -1494,15 +1504,16 @@ async def get_all_new_items(ctx):
                 diff_items[item_name] = new_total - seen_total
 
         if diff_items:
+            flag_map = gomode_bot.slot_item_flags(item_flags, items_received, slot_name)
             # Underline the slot name using ANSI escape sequences
             underline_start = "[4;2m"
             underline_end = "[0m"
 
-            header = f"{underline_start}Items received for {slot_name}:{underline_end}"
+            header = f"{underline_start}{slot_name}:{underline_end}"
 
             diff_message_lines.append(header)
             for item_name, diff_amount in diff_items.items():
-                diff_message_lines.append(f"{item_name} +{diff_amount}")
+                diff_message_lines.append(item_line(item_name, diff_amount, flag_map.get(item_name), plus=True))
             diff_message_lines.append("")  # blank line for separation
             # Update seen items to the current aggregated totals.
             for item_name, new_total in agg_new.items():
@@ -1571,6 +1582,7 @@ async def get_new_items_for_slot(ctx, slot_name: str):
     diff_message_lines = []
     updated = False
     assignments = listeners_data[author_id]
+    item_flags = await _item_flags_for(run)
     for assignment in assignments:
         assigned_slot = assignment.get("slot_name", "")
         if assigned_slot.lower() != slot_name.lower():
@@ -1607,16 +1619,17 @@ async def get_new_items_for_slot(ctx, slot_name: str):
                 diff_items[item_name] = new_total - seen_total
 
         if diff_items:
+            flag_map = gomode_bot.slot_item_flags(item_flags, items_received, assigned_slot)
 
             # Underline the slot name using ANSI escape sequences
             underline_start = "[4;2m"
             underline_end = "[0m"
 
-            header = f"{underline_start}Items received for {assigned_slot}:{underline_end}"
+            header = f"{underline_start}{assigned_slot}:{underline_end}"
 
             diff_message_lines.append(header)
             for item_name, diff_amount in diff_items.items():
-                diff_message_lines.append(f"{item_name} +{diff_amount}")
+                diff_message_lines.append(item_line(item_name, diff_amount, flag_map.get(item_name), plus=True))
             diff_message_lines.append("")
             for item_name, new_total in agg_new.items():
                 seen_items[item_name] = new_total
@@ -1697,23 +1710,20 @@ async def send_items(ctx, assignment, initial_response, run=None):
         return message
 
     items_dict = slot_data.get("Items", {})
+    flag_map = gomode_bot.slot_item_flags(await _item_flags_for(run), items_received, slot_name)
 
     # Underline the slot name using ANSI escape sequences
     underline_start = "[4;2m"
     underline_end = "[0m"
 
-    header = f"{underline_start}Items received for {slot_name}:{underline_end}"
+    header = f"{underline_start}{slot_name}:{underline_end}"
     lines = [header]
 
     # Build a line for each received item
     for key, item_info in items_dict.items():
         item_name = item_info.get("item_name", "Unknown")
         amount = item_info.get("amount", "Unknown")
-        if amount == 1:
-            line = f"{item_name}"
-        else:
-            line = f"{item_name} x{amount}"
-        lines.append(line)
+        lines.append(item_line(item_name, amount, flag_map.get(item_name)))
 
     message = "\n".join(lines)
     return message
@@ -1730,7 +1740,50 @@ def _log_announced(diff):
                 log_goal.info("Announced goal complete for %s", slot_name)
 
 
-def format_diff_message(diff):
+ANSI_RESET = "[0m"
+ANSI_UNDERLINE = "[4;2m"
+# Item classification bits in a seed (Archipelago's own): 1 progression, 2 useful, 4 trap.
+# Discord's ANSI palette has no purple, so progression uses its magenta.
+ANSI_PROGRESSION = "[1;35m"
+ANSI_USEFUL = "[1;34m"
+ANSI_TRAP = "[1;31m"
+
+
+def colorize_item(name, flags):
+    """The item name in its classification's colour; unknown or filler stays plain."""
+    if not isinstance(flags, int):
+        return name
+    if flags & 1:
+        return f"{ANSI_PROGRESSION}{name}{ANSI_RESET}"
+    if flags & 2:
+        return f"{ANSI_USEFUL}{name}{ANSI_RESET}"
+    if flags & 4:
+        return f"{ANSI_TRAP}{name}{ANSI_RESET}"
+    return name
+
+
+def item_line(name, count, flags, plus=False):
+    """'Name' for one item, 'Name +N' (new items) or 'Name xN' (running totals) for more."""
+    try:
+        many = int(count) > 1
+    except (TypeError, ValueError):
+        many = True
+    text = colorize_item(name, flags)
+    if many:
+        text += f" +{count}" if plus else f" x{count}"
+    return text
+
+
+async def _item_flags_for(run=None):
+    """The registered seed's item classifications; {} when unavailable, so items stay plain."""
+    try:
+        return await gomode_bot.load_item_flags(**_rk(run)) or {}
+    except Exception as e:
+        log_error.exception("Could not load item colours: %s", e)
+        return {}
+
+
+def format_diff_message(diff, item_flags=None, items_received=None):
     lines = []
 
     # Underline the slot name using ANSI escape sequences
@@ -1752,9 +1805,10 @@ def format_diff_message(diff):
         new_items = details.get("New Items", {})
         if not new_items:
             continue
-        lines.append(f"{underline_start}Items received for {slot_name}:{underline_end}")
+        lines.append(f"{underline_start}{slot_name}:{underline_end}")
+        flag_map = gomode_bot.slot_item_flags(item_flags, items_received, slot_name)
         for item_name, change in new_items.items():
-            lines.append(f"{item_name} +{change}")
+            lines.append(item_line(item_name, change, flag_map.get(item_name), plus=True))
         lines.append("")  # blank line for separation
     return "\n".join(lines)
 
@@ -1851,7 +1905,8 @@ async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
                 if not diff:
                     log_feed.info("Only filler items received, nothing posted")
             if diff:
-                message = format_diff_message(diff)
+                message = format_diff_message(diff, await _item_flags_for(run),
+                                              gomode_bot._load_items_received(**_rk(run)))
                 # Prepare to send the message in a code block.
                 # Adjust the maximum content length to account for the code block wrappers.
                 wrapper_length = len("```\n") + len("\n```")
@@ -2275,14 +2330,18 @@ async def _run_unstuck_alerts(run=None):
 
         before = previous.get("inventory", {})
         flags = (item_flags.get(name) or {}).get("items", {})
-        new_items = [f"{item}" + (f" x{count - before.get(item, 0)}" if count - before.get(item, 0) > 1 else "")
+        new_items = [item_line(item, count - before.get(item, 0), flags.get(item), plus=True)
                      for item, count in inventory.items()
                      if count > before.get(item, 0) and flags.get(item) != 0]
         game = st.get("game") or ""
         msg = (prefix + f"🔓 **{name}**" + (f" ({game})" if game else "") +
                f" has **{to_do}** check{'s' if to_do != 1 else ''} in logic again.")
         if new_items:
-            msg += "\nNew since then: " + ", ".join(new_items[:15])
+            # In an ansi block so the item colours show; trimmed to stay under Discord's limit.
+            shown = new_items[:15]
+            while len(shown) > 1 and len(msg) + len(", ".join(shown)) + 40 > 1950:
+                shown.pop()
+            msg += "\n```ansi\nNew since then: " + ", ".join(shown) + "\n```"
         for user_id in user_ids:
             try:
                 user = await bot.fetch_user(int(user_id))

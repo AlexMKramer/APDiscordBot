@@ -45,48 +45,61 @@ def satisfies(node: dict, held: dict) -> bool:
     raise ValueError(f"unknown node type {t!r}")
 
 
-def _fmt_bundle(opt: dict) -> str:
-    parts = [k if v == 1 else f"{k} x{v}" for k, v in sorted(opt.items())]
+def colouring(flags: dict):
+    """An item-name formatter that wraps a name in its classification's ANSI colour (progression
+    magenta, useful blue, trap red, by the seed's flags); unknown and filler names stay plain."""
+    def nm(name):
+        f = flags.get(name)
+        if not isinstance(f, int):
+            return name
+        code = 35 if f & 1 else 34 if f & 2 else 31 if f & 4 else None
+        return name if code is None else f"[1;{code}m{name}[0m"
+    return nm
+
+
+def _fmt_bundle(opt: dict, nm=str) -> str:
+    parts = [nm(k) if v == 1 else f"{nm(k)} x{v}" for k, v in sorted(opt.items())]
     return parts[0] if len(parts) == 1 else "(" + " + ".join(parts) + ")"
 
 
-def render(node: dict, indent: int = 0) -> list[str]:
+def render(node: dict, indent: int = 0, nm=str) -> list[str]:
+    """nm formats an item name (the bot passes one that colours it); the default leaves it plain."""
     pad = "  " * indent
     t = node["type"]
     if t == "item":
         c = node["count"]
-        return [f"{pad}- {node['name']}" + (f" x{c}" if c != 1 else "")]
+        return [f"{pad}- {nm(node['name'])}" + (f" x{c}" if c != 1 else "")]
     if t == "atleast":
         opts = node["options"]
-        shown = ", ".join(_fmt_bundle(o) for o in opts[:12])
+        shown = ", ".join(_fmt_bundle(o, nm) for o in opts[:12])
         if len(opts) > 12:
             shown += f", +{len(opts) - 12} more"
         return [f"{pad}- any {node['n']} of: {shown}"]
     if t == "all":
         lines = []
         for c in node["children"]:
-            lines += render(c, indent)
+            lines += render(c, indent, nm)
         return lines
     if t == "any":
         if all(c["type"] == "item" for c in node["children"]):
-            opts = ", ".join((f"{c['name']} x{c['count']}" if c["count"] != 1 else c["name"])
+            opts = ", ".join((f"{nm(c['name'])} x{c['count']}" if c["count"] != 1 else nm(c["name"]))
                              for c in node["children"])
             return [f"{pad}- one of: {opts}"]
         lines = [f"{pad}- ONE of these routes:"]
         for i, c in enumerate(node["children"], 1):
             lines.append(f"{pad}  Route {i}:")
-            lines += render(c, indent + 2)
+            lines += render(c, indent + 2, nm)
         return lines
     return []
 
 
-def render_requirements(req: dict) -> list[str]:
+def render_requirements(req: dict, nm=str) -> list[str]:
     """Player-facing summary of what's still needed to reach go mode."""
     if req.get("verified") and req.get("tree"):
-        return ["To reach go mode, you still need:"] + render(req["tree"])
+        return ["To reach go mode, you still need:"] + render(req["tree"], 0, nm)
 
     def fmt(x):
-        return x["name"] + (f" x{x['count']}" if x["count"] != 1 else "")
+        return nm(x["name"]) + (f" x{x['count']}" if x["count"] != 1 else "")
 
     required = req.get("required", [])
     example = req.get("example_path", [])
