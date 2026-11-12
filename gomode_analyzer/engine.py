@@ -358,6 +358,31 @@ def _finish(multiworld, world_type, precollected, pre_filled: bool = False):
                         start_names=dict(Counter(item.name for item in start_items))), ""
 
 
+def _with_own_pre_fill(world_type, opts, name, rng, fake, precollected, prepared, expected_locations,
+                       expected_prog, expected_own_items):
+    """The same exact rebuild with the world's own pre_fill run, or None. Worlds such as Ship of
+    Harkinian place songs and their own dungeon keys in pre_fill; without those placements a go-mode
+    sweep can't collect an item still sitting in one of the player's own checks. Taken only when the
+    rebuild still matches the seed and every item it placed is the one the seed has at that location."""
+    from worlds.AutoWorld import World
+    if not expected_own_items or getattr(world_type, "pre_fill", None) is getattr(World, "pre_fill", None):
+        return None
+    try:
+        multiworld = _build_multiworld(world_type, opts, name, None, rng, fake=fake, pre_fill=True)
+        filled, _ = _finish(multiworld, world_type, precollected, True)
+    except Exception:  # noqa: BLE001 -- keep the rebuild without pre_fill
+        return None
+    if filled is None or _mismatch(filled.multiworld, expected_locations or set(), expected_prog or Counter()):
+        return None
+    placed = [loc for loc in filled.multiworld.get_locations(1)
+              if loc.address is not None and loc.item is not None and loc.item.code is not None]
+    before = sum(1 for loc in prepared.multiworld.get_locations(1)
+                 if loc.address is not None and loc.item is not None and loc.item.code is not None)
+    if len(placed) <= before or any(expected_own_items.get(loc.address) != loc.item.code for loc in placed):
+        return None
+    return filled
+
+
 def _run_pre_fill(multiworld, world) -> bool:
     """Run the world's own pre_fill step. Only used when the goal can't be reached without it,
     so a world whose pre_fill needs more than a solo no-fill build just stays unreachable."""
@@ -416,12 +441,15 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
                  slot_data: Optional[dict] = None, datapackage: Optional[dict] = None,
                  gen_seed: Optional[int] = None, players: int = 0,
                  expected_locations: Optional[set] = None, expected_prog: Optional[Counter] = None,
-                 result: Optional[SlotResult] = None):
+                 expected_own_items: Optional[dict] = None, result: Optional[SlotResult] = None):
     """Rebuild one slot's logic. Returns (PreparedSlot or None, SlotResult); on None the result
     carries the unsupported/error status and reason.
 
     With the seed's record of the slot (`expected_locations`, `expected_prog`), each way of
-    rebuilding is checked against it and the first exact match is used."""
+    rebuilding is checked against it and the first exact match is used. With `expected_own_items`
+    ({location id: item id} for the slot's own items in its own locations), an exact rebuild of a
+    world that places items itself in pre_fill is redone with pre_fill when that places every item
+    where the seed has it."""
     # Lazy AP imports -- the caller is responsible for putting the (version-pinned) AP
     # source on sys.path before calling this.
     from worlds.AutoWorld import AutoWorldRegister
@@ -510,6 +538,12 @@ def prepare_slot(game: str, options: dict, *, slot: Optional[int] = None, name: 
             tag = label if how == "none" or label == "seed" else f"{label}({how})"
             if best is None or (mismatch is not None and mismatch < best[0]):
                 best = (mismatch, prepared, tag, source)
+                if mismatch == 0 and how == "none" and label in ("seed", "seed(real)"):
+                    filled = _with_own_pre_fill(world_type, opts, name, cand_rng, label == "seed",
+                                                precollected, prepared, expected_locations,
+                                                expected_prog, expected_own_items)
+                    if filled is not None:
+                        best = (0, filled, label + "+pre_fill(placed)", source)
             break
         if best is not None and not best[0]:
             break  # an exact match (or nothing to check against): take it
@@ -675,7 +709,8 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
                  precollected: Optional[list] = None, slot_data: Optional[dict] = None,
                  datapackage: Optional[dict] = None, gen_seed: Optional[int] = None,
                  players: int = 0, expected_locations: Optional[set] = None,
-                 expected_prog: Optional[Counter] = None, fast: bool = False) -> SlotResult:
+                 expected_prog: Optional[Counter] = None, expected_own_items: Optional[dict] = None,
+                 fast: bool = False, checked: Optional[set] = None) -> SlotResult:
     """Analyze one slot.
 
     `options` is the slot's resolved slot_data options (may be empty). `spoiler_settings`
@@ -696,18 +731,21 @@ def analyze_slot(game: str, options: dict, inventory: dict, *, slot: Optional[in
                                     slot_data=slot_data, datapackage=datapackage,
                                     gen_seed=gen_seed, players=players,
                                     expected_locations=expected_locations,
-                                    expected_prog=expected_prog, result=result)
+                                    expected_prog=expected_prog, expected_own_items=expected_own_items,
+                                    result=result)
     if prepared is None:
         return result
-    return analyze_prepared(prepared, result, inventory, fast=fast)
+    return analyze_prepared(prepared, result, inventory, fast=fast, checked=checked)
 
 
 def analyze_prepared(prepared: PreparedSlot, result: SlotResult, inventory: dict, *,
-                     fast: bool = False) -> SlotResult:
+                     fast: bool = False, checked: Optional[set] = None) -> SlotResult:
     """analyze_slot's analysis for a slot that's already built. `result` is the SlotResult
-    prepare_slot returned; it's filled in and returned."""
+    prepare_slot returned; it's filled in and returned. `checked` is the set of the slot's done
+    location ids; the items those checks gave are in `inventory`, so they aren't collected again."""
     multiworld = prepared.multiworld
     current, result.unknown_inventory = inventory_state(prepared, inventory)
+    _mark_received_checks(prepared, current, checked)
 
     # Are they already in go-mode? UT's test: what they hold, plus a sweep of their own event
     # (and locked) locations, against the goal.
@@ -764,6 +802,20 @@ def analyze_prepared(prepared: PreparedSlot, result: SlotResult, inventory: dict
             req["unverified_tree"] = tree
         result.requirements = req
     return result
+
+
+def _mark_received_checks(prepared: PreparedSlot, state, checked) -> None:
+    """Mark the player's done checks as already collected in `state`. can_beat_game sweeps every
+    location it can reach, so a real item the rebuilt world placed in one of the player's own checks
+    (Banjo-Tooie's Mumbo Token for each rescued Jinjo family, Ship of Harkinian's pre-filled items)
+    would be collected there again although the tracker already lists the copy that check gave as
+    received. Sweeps skip the locations in state.locations_checked, so each copy counts once."""
+    if not checked:
+        return
+    for loc in prepared.multiworld.get_locations(1):
+        if (loc.address is not None and loc.address in checked
+                and loc.item is not None and loc.item.code is not None):
+            state.locations_checked.add(loc)
 
 
 def _is_goal_event(multiworld, item, locked: set) -> bool:

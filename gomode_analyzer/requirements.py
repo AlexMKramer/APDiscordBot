@@ -70,11 +70,16 @@ def render(node: dict, indent: int = 0, nm=str) -> list[str]:
         c = node["count"]
         return [f"{pad}- {nm(node['name'])}" + (f" x{c}" if c != 1 else "")]
     if t == "atleast":
-        opts = node["options"]
+        # Each entry counts once, and only in full (an entry "x3" needs all three), so say "different".
+        # When every entry is needed, list them as plain requirements instead of a choice.
+        opts, n = node["options"], node["n"]
+        if n >= len(opts):
+            return [line for o in opts for line in render(_bundle_node(o), indent, nm)]
         shown = ", ".join(_fmt_bundle(o, nm) for o in opts[:12])
         if len(opts) > 12:
             shown += f", +{len(opts) - 12} more"
-        return [f"{pad}- any {node['n']} of: {shown}"]
+        head = "one" if n == 1 else f"any {n} different ones"
+        return [f"{pad}- {head} of these {len(opts)}: {shown}"]
     if t == "all":
         lines = []
         for c in node["children"]:

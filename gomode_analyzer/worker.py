@@ -73,6 +73,10 @@ def main(argv=None) -> int:
         name_to_id = sd.datapackage.get("location_name_to_id", {})
         return {name_to_id[n] for n in names or [] if n in name_to_id}
 
+    def checked_or_none(sd, names):
+        # Callers that send no checked list get the analysis without it.
+        return None if names is None else checked_ids(sd, names)
+
     def per_slot(requested: dict, answer) -> dict:
         results = {}
         for name, request in requested.items():
@@ -86,8 +90,9 @@ def main(argv=None) -> int:
                 results[name] = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
         return results
 
-    def go_mode(sd, prepared, result, inventory):
-        res = engine.analyze_prepared(prepared, fresh(result), inventory or {}, fast=True)
+    def go_mode(sd, prepared, result, inventory, checked):
+        res = engine.analyze_prepared(prepared, fresh(result), inventory or {}, fast=True,
+                                      checked=checked_or_none(sd, checked))
         return {"status": res.status, "in_go_mode": res.in_go_mode, "reason": res.reason}
 
     def checks(sd, prepared, result, request):
@@ -131,7 +136,10 @@ def main(argv=None) -> int:
         if op == "ping":
             return {"seed": seed.seed_name}
         if op == "go_mode":
-            return per_slot(request.get("slots") or {}, lambda sd, p, r, inv: go_mode(sd, p, r, inv))
+            # "checked" is optional: {slot name: [checked location names]}.
+            checked = {str(k).lower(): v for k, v in (request.get("checked") or {}).items()}
+            return per_slot(request.get("slots") or {},
+                            lambda sd, p, r, inv: go_mode(sd, p, r, inv, checked.get(sd.name.lower())))
         if op == "checks":
             return per_slot(request.get("slots") or {}, checks)
         if op == "sphere_zero":
@@ -140,7 +148,8 @@ def main(argv=None) -> int:
             sd, prepared, result = lookup(request["slot"])
             if prepared is None:
                 return result.to_dict()
-            res = engine.analyze_prepared(prepared, fresh(result), request.get("inventory") or {})
+            res = engine.analyze_prepared(prepared, fresh(result), request.get("inventory") or {},
+                                          checked=checked_or_none(sd, request.get("checked")))
             output = {**res.to_dict(), "seed": seed.seed_name, "version": seed.version_str}
             if res.status == "ok" and not res.in_go_mode:
                 output["requirements_text"] = requirements.render_requirements(

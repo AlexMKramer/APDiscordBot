@@ -921,7 +921,8 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str, run=None):
     """Detailed 'what do I still need' for one slot, against current inventory."""
     rk = _rk(run)
     inventory = gomode_bot.current_inventory(slot_name, **rk)
-    res = await gomode_bot.analyze_slot_live(slot_name, inventory, colour=True, **rk)
+    res = await gomode_bot.analyze_slot_live(slot_name, inventory, colour=True,
+                                             checked=gomode_bot.current_checked(slot_name, **rk), **rk)
     if res is None:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")

@@ -31,6 +31,7 @@ class SlotData:
     # What the real generation produced for this slot, to check a rebuild against:
     location_ids: set = field(default_factory=set)        # the slot's real location IDs
     prog_item_ids: Counter = field(default_factory=Counter)  # its progression items placed anywhere
+    own_items: dict = field(default_factory=dict)         # location ID -> item ID, its own items in its own locations
     item_flags: dict = field(default_factory=dict)        # item name -> flags of all its copies OR'd
     sphere_zero: Optional[set] = None  # location IDs in sphere 0 per the seed's own playthrough; None if the seed has none
 
@@ -57,6 +58,7 @@ class SeedData:
             "datapackage": sd.datapackage,
             "gen_seed": None if self.race_mode else self.gen_seed, "players": self.players,
             "expected_locations": sd.location_ids, "expected_prog": sd.prog_item_ids,
+            "expected_own_items": sd.own_items,
         }
 
     def find_slot(self, name: str) -> Optional[SlotData]:
@@ -113,9 +115,11 @@ def load_seed(zip_path: str) -> SeedData:
     # 0b10 useful, 0b100 trap, 0 filler.
     location_ids: dict = {}
     prog_item_ids: dict = {}
+    own_items: dict = {}
     item_id_flags: dict = {}   # receiving slot -> {item_id: flags of every copy OR'd together}
     for sid, locs in (decoded.get("locations", {}) or {}).items():
         location_ids[sid] = set(locs)
+        own_items[sid] = {loc_id: item_id for loc_id, (item_id, receiver, _f) in locs.items() if receiver == sid}
         for item_id, receiver, flags in locs.values():
             if flags & 0b1:
                 prog_item_ids.setdefault(receiver, Counter())[item_id] += 1
@@ -143,6 +147,7 @@ def load_seed(zip_path: str) -> SeedData:
             datapackage=datapackage.get(game) or {},
             location_ids=location_ids.get(sid, set()),
             prog_item_ids=prog_item_ids.get(sid, Counter()),
+            own_items=own_items.get(sid, {}),
             item_flags=_names(item_id_flags.get(sid, {}), datapackage.get(game) or {}),
             sphere_zero=None if first_sphere is None else set(first_sphere.get(sid, ()) or ()),
         )

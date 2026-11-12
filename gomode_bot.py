@@ -279,6 +279,11 @@ def current_inventory(slot_name: str, run=None) -> dict:
     return inventory_for_slot(_load_items_received(**_rk(run)), slot_name)
 
 
+def current_checked(slot_name: str, run=None) -> list:
+    """The slot's checked location names from items_received.json on disk."""
+    return checked_for_slot(_load_items_received(**_rk(run)), slot_name)
+
+
 def _tracker_game_for_slot(items_received: dict, slot_name: str):
     """The game the live tracker reports for a slot name (used to catch a registered seed that
     doesn't match what's being tracked)."""
@@ -423,6 +428,7 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None, run=
 
     result: dict = {}
     batch: dict = {}
+    checked: dict = {}
     for name in slot_names:
         rec = slot_for_name(cache, name)
         if rec is None:
@@ -443,11 +449,12 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None, run=
             continue
 
         batch[name] = inventory_for_slot(items_received, name)
+        checked[name] = checked_for_slot(items_received, name)
         result[name] = {"status": "ok", "in_go_mode": None, "game": game}
 
     if batch:
         try:
-            oracle = await worker_for(run).request("go_mode", slots=batch)
+            oracle = await worker_for(run).request("go_mode", slots=batch, checked=checked)
         except Exception as e:  # noqa: BLE001 -- leave in_go_mode None; the next cycle retries
             log_error.exception("Go-mode analyzer request failed, will retry next cycle: %s", e)
             oracle = {}
@@ -463,13 +470,16 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None, run=
     return result
 
 
-async def analyze_slot_live(slot_name: str, inventory: dict, colour: bool = False, run=None) -> dict | None:
-    """Full on-demand analysis of one slot for the player's current inventory. Returns the
-    analysis dict (incl. `requirements_text`), or None if no seed is registered."""
+async def analyze_slot_live(slot_name: str, inventory: dict, colour: bool = False, run=None,
+                            checked: list | None = None) -> dict | None:
+    """Full on-demand analysis of one slot for the player's current inventory (and checked
+    location names, when given). Returns the analysis dict (incl. `requirements_text`), or None
+    if no seed is registered."""
     if load_registry(**_rk(run)) is None:
         return None
+    extra = {} if checked is None else {"checked": checked}
     try:
-        return await worker_for(run).request("analyze", slot=slot_name, inventory=inventory, colour=colour)
+        return await worker_for(run).request("analyze", slot=slot_name, inventory=inventory, colour=colour, **extra)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "reason": str(e)[-500:]}
 
