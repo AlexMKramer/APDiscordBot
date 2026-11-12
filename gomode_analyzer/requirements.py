@@ -45,15 +45,28 @@ def satisfies(node: dict, held: dict) -> bool:
     raise ValueError(f"unknown node type {t!r}")
 
 
+# Item colours, shared with the bot so both colour items the same way. Classification bits are
+# Archipelago's own: 1 progression, 2 useful, 4 trap. Each is bold, then a named colour for clients
+# without truecolor, then the exact RGB shade (38;2;R;G;B), which wins where it is supported.
+ANSI_PROGRESSION = "\x1b[1;35;38;2;182;0;251m"  # #B600FB
+ANSI_USEFUL = "\x1b[1;34;38;2;64;64;222m"       # #4040DE
+ANSI_TRAP = "\x1b[1;31;38;2;222;64;64m"         # #DE4040
+ANSI_RESET = "\x1b[0m"
+
+
+def colour_item(name: str, flags) -> str:
+    """The item name in its classification's colour; unknown or filler stays plain."""
+    if not isinstance(flags, int):
+        return name
+    code = ANSI_PROGRESSION if flags & 1 else ANSI_USEFUL if flags & 2 else ANSI_TRAP if flags & 4 else None
+    return name if code is None else f"{code}{name}{ANSI_RESET}"
+
+
 def colouring(flags: dict):
-    """An item-name formatter that wraps a name in its classification's ANSI colour (progression
-    magenta, useful blue, trap red, by the seed's flags); unknown and filler names stay plain."""
+    """An item-name formatter that wraps a name in its classification's ANSI colour (by the seed's
+    flags); unknown and filler names stay plain."""
     def nm(name):
-        f = flags.get(name)
-        if not isinstance(f, int):
-            return name
-        code = 35 if f & 1 else 34 if f & 2 else 31 if f & 4 else None
-        return name if code is None else f"[1;{code}m{name}[0m"
+        return colour_item(name, flags.get(name))
     return nm
 
 

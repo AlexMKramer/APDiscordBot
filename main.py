@@ -18,7 +18,9 @@ import hints_pin
 import hint_client
 import log_setup
 import platform
+import re
 from urllib.parse import urlparse
+from gomode_analyzer.requirements import colour_item
 
 dotenv.load_dotenv()
 log_path = log_setup.setup()
@@ -949,16 +951,15 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str, run=None):
     # too, since Discord only renders colours there).
     ansi_header = f"{ANSI_UNDERLINE}{slot_name}" + (f" ({game})" if game else "") + ANSI_RESET
     body = ansi_header + "\n" + "\n".join(lines)
-    wrapper_length = len("```ansi\n") + len("\n```")
-    max_content_length = 1950 - wrapper_length
-    if len(body) <= max_content_length:
-        await initial_response.edit_original_response(content=f"```ansi\n{body}\n```")
+    reply = ansi_messages(body)
+    if len(reply) == 1:
+        await initial_response.edit_original_response(content=reply[0])
         return
     # Long requirement trees: DM the full list, and only claim success if the DM actually sent
     # (catch HTTPException, not just Forbidden, so a rate-limit mid-stream can't escape).
     try:
-        for chunk in chunk_text_by_line(body, max_content_length):
-            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
+        for message in ansi_messages(body, _dm_prefix(run)):
+            await ctx.author.send(message)
         await initial_response.edit_original_response(
             content=f"{header}\nThe list is long — I've sent it to you in a DM.")
     except discord.Forbidden:
@@ -1017,8 +1018,8 @@ async def items_to_go_mode(ctx, slot_name: str = None):
     # Many assigned slots (e.g. via a wildcard assign) can overflow -- DM the full list rather
     # than silently truncating it.
     try:
-        for chunk in chunk_text_by_line(content, 1900):
-            await ctx.author.send(_dm_prefix(run) + chunk)
+        for message in plain_messages(content, _dm_prefix(run)):
+            await ctx.author.send(message)
         await initial_response.edit_original_response(
             content="Your list is long — I've sent the full status to you in a DM.")
     except discord.Forbidden:
@@ -1134,8 +1135,8 @@ async def checks_in_logic(ctx, slot_names: str = None):
     if unmatched:
         lines.append(f"No slots matched: {', '.join(unmatched)}")
     try:
-        for chunk in chunk_text_by_line("\n".join(lines), 1900):
-            await ctx.author.send(_dm_prefix(run) + chunk)
+        for message in plain_messages("\n".join(lines), _dm_prefix(run)):
+            await ctx.author.send(message)
         await initial_response.edit_original_response(
             content=f"Sent you a DM with checks in logic for {len(names)} slot{'s' if len(names) != 1 else ''}.")
     except discord.Forbidden:
@@ -1212,8 +1213,8 @@ async def sphere_zero_checks(ctx, slot_names: str = None):
     names = _unsupported_last(names, status)
     message = _sphere_zero_message(names, status, unmatched)
     try:
-        for chunk in chunk_text_by_line(message, 1900):
-            await ctx.author.send(_dm_prefix(run) + chunk)
+        for part in plain_messages(message, _dm_prefix(run)):
+            await ctx.author.send(part)
         await initial_response.edit_original_response(
             content=f"Sent you a DM with the sphere 0 checks for {len(names)} slot{'s' if len(names) != 1 else ''}.")
     except discord.Forbidden:
@@ -1256,8 +1257,8 @@ async def which_checks_in_logic(ctx, slot_name: str):
     elif st.get("status") == "ok" and st.get("done", 0) < st.get("total", 0):
         message += "\n  Nothing in logic is left to do right now."
     try:
-        for chunk in chunk_text_by_line(message, 1900):
-            await ctx.author.send(_dm_prefix(run) + chunk)
+        for part in plain_messages(message, _dm_prefix(run)):
+            await ctx.author.send(part)
         await initial_response.edit_original_response(
             content=f"Sent you a DM with the checks in logic for **{name}**.")
     except discord.Forbidden:
@@ -1306,8 +1307,8 @@ async def most_useful_items(ctx, slot_name: str):
         message = "\n".join(lines)
         use_ansi = True
     try:
-        for chunk in chunk_text_by_line(message, 1950 - len("```ansi\n") - len("\n```") if use_ansi else 1900):
-            await ctx.author.send(_dm_prefix(run) + (f"```ansi\n{chunk}\n```" if use_ansi else chunk))
+        for part in (ansi_messages if use_ansi else plain_messages)(message, _dm_prefix(run)):
+            await ctx.author.send(part)
         await initial_response.edit_original_response(
             content=f"Sent you a DM with the most useful items for **{name}**.")
     except discord.Forbidden:
@@ -1489,17 +1490,10 @@ async def get_items_for_slot(ctx, slot_name: str):
     # Get the message built by send_items for this assignment.
     message = await send_items(ctx, assignment, initial_response, run)
 
-    # Use plain code block formatting (without "ansi").
-    wrapper_length = len("``ansi`\n") + len("\n```")
-    max_content_length = 1950 - wrapper_length
-
-    # Break the message into chunks that fit within Discord's limits.
-    chunks = chunk_text_by_line(message, max_content_length)
-
     try:
-        # DM each chunk to the user.
-        for chunk in chunks:
-            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
+        # DM the list in ansi blocks that fit within Discord's limits.
+        for part in ansi_messages(message, _dm_prefix(run)):
+            await ctx.author.send(part)
         await initial_response.edit_original_response(
             content="I've sent you a DM with a list of items for the specified slot."
         )
@@ -1610,14 +1604,12 @@ async def get_all_new_items(ctx):
         diff_message = "\n".join(diff_message_lines)
 
     # Chunk the diff message.
-    wrapper_length = len("```ansi\n") + len("\n```")
-    max_message_length = 1950 - wrapper_length
-    chunks = chunk_text_by_line(diff_message, max_message_length)
+    chunks = ansi_messages(diff_message, _dm_prefix(run))
 
     await ctx.respond("I've sent you a DM with your new items for all your assigned games.", ephemeral=True)
     try:
         for chunk in chunks:
-            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
+            await ctx.author.send(chunk)
     except discord.Forbidden:
         await ctx.respond("I couldn't send you a DM. Please check your DM settings.", ephemeral=True)
 
@@ -1724,32 +1716,64 @@ async def get_new_items_for_slot(ctx, slot_name: str):
     else:
         diff_message = "\n".join(diff_message_lines)
 
-    wrapper_length = len("```ansi\n") + len("\n```")
-    max_message_length = 1950 - wrapper_length
-    chunks = chunk_text_by_line(diff_message, max_message_length)
+    chunks = ansi_messages(diff_message, _dm_prefix(run))
 
     await ctx.respond("I've sent you a DM with your new items for the specified slot.", ephemeral=True)
     try:
         for chunk in chunks:
-            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
+            await ctx.author.send(chunk)
     except discord.Forbidden:
         await ctx.respond("I couldn't send you a DM. Please check your DM settings.", ephemeral=True)
 
 
-# Helper function to split text into chunks without breaking lines
+# Discord refuses messages over 2000 characters; stay a little under it. Escape codes count too.
+MESSAGE_LIMIT = 1950
+ANSI_BLOCK_OPEN, ANSI_BLOCK_CLOSE = "```ansi\n", "\n```"
+_ANSI_CODE = re.compile(r"\x1b\[[0-9;]*m")
+_LINE_TOKEN = re.compile(r"\x1b\[[0-9;]*m|[ \t]+|[^ \t\x1b]+|\x1b")
+# Room kept on each piece of a split line for the colour it reopens and the reset that closes it.
+_SPLIT_RESERVE = 40
+
+
+def _split_long_line(line, max_length):
+    """Pieces of one line that is longer than max_length, each at most max_length. It breaks at
+    spaces where it can and never inside an escape code; a colour still open at a break is closed
+    there and opened again at the start of the next piece."""
+    room = max(1, max_length - _SPLIT_RESERVE)
+    tokens = []
+    for token in _LINE_TOKEN.findall(line):
+        if len(token) > room and not _ANSI_CODE.fullmatch(token):
+            tokens += [token[i:i + room] for i in range(0, len(token), room)]
+        else:
+            tokens.append(token)
+    pieces, current, active = [], "", None
+    for token in tokens:
+        is_code = bool(_ANSI_CODE.fullmatch(token))
+        closing = len(ANSI_RESET) if (active or is_code) else 0
+        if _ANSI_CODE.sub("", current) and len(current) + len(token) + closing > max_length:
+            pieces.append(current + (ANSI_RESET if active else ""))
+            current = active or ""
+            if token.isspace():
+                continue
+        current += token
+        if is_code:
+            active = None if token in (ANSI_RESET, "\x1b[m") else token
+    if _ANSI_CODE.sub("", current) or not pieces:
+        pieces.append(current + (ANSI_RESET if active else ""))
+    return pieces
+
+
 def chunk_text_by_line(content, max_length):
-    """
-    Split content into chunks that do not exceed max_length.
-    Splitting is done at newline boundaries so that lines are not broken.
-    """
-    lines = content.splitlines()
+    """Split content into chunks of at most max_length characters, escape codes included. Chunks
+    break between lines; a single line longer than max_length is split on its own (see
+    _split_long_line), so no chunk ever ends inside an escape code or with a colour left open."""
     chunks = []
     current_chunk = ""
-    for line in lines:
-        if not current_chunk:
-            current_chunk = line
-        else:
-            if len(current_chunk) + 1 + len(line) > max_length:
+    for whole_line in content.splitlines():
+        for line in ([whole_line] if len(whole_line) <= max_length else _split_long_line(whole_line, max_length)):
+            if not current_chunk:
+                current_chunk = line
+            elif len(current_chunk) + 1 + len(line) > max_length:
                 chunks.append(current_chunk)
                 current_chunk = line
             else:
@@ -1757,6 +1781,18 @@ def chunk_text_by_line(content, max_length):
     if current_chunk:
         chunks.append(current_chunk)
     return chunks
+
+
+def ansi_messages(body, prefix=""):
+    """body as Discord messages: each an ```ansi block (so colours show) after prefix, and each,
+    prefix and fences included, at most MESSAGE_LIMIT characters."""
+    room = MESSAGE_LIMIT - len(prefix) - len(ANSI_BLOCK_OPEN) - len(ANSI_BLOCK_CLOSE)
+    return [f"{prefix}{ANSI_BLOCK_OPEN}{chunk}{ANSI_BLOCK_CLOSE}" for chunk in chunk_text_by_line(body, room)]
+
+
+def plain_messages(body, prefix=""):
+    """body as plain Discord messages after prefix, each at most MESSAGE_LIMIT characters."""
+    return [prefix + chunk for chunk in chunk_text_by_line(body, MESSAGE_LIMIT - len(prefix))]
 
 
 # Updated send_items: searches for the assignment's slot in the new items_received.json format,
@@ -1821,24 +1857,11 @@ def _log_announced(diff):
 
 ANSI_RESET = "[0m"
 ANSI_UNDERLINE = "[4;2m"
-# Item classification bits in a seed (Archipelago's own): 1 progression, 2 useful, 4 trap.
-# Discord's ANSI palette has no purple, so progression uses its magenta.
-ANSI_PROGRESSION = "[1;35m"
-ANSI_USEFUL = "[1;34m"
-ANSI_TRAP = "[1;31m"
-
-
+# Item colours (progression, useful, trap) come from gomode_analyzer.requirements, which colours the
+# go-mode requirement tree the same way.
 def colorize_item(name, flags):
     """The item name in its classification's colour; unknown or filler stays plain."""
-    if not isinstance(flags, int):
-        return name
-    if flags & 1:
-        return f"{ANSI_PROGRESSION}{name}{ANSI_RESET}"
-    if flags & 2:
-        return f"{ANSI_USEFUL}{name}{ANSI_RESET}"
-    if flags & 4:
-        return f"{ANSI_TRAP}{name}{ANSI_RESET}"
-    return name
+    return colour_item(name, flags)
 
 
 def item_line(name, count, flags, plus=False):
@@ -1986,14 +2009,11 @@ async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
             if diff:
                 message = format_diff_message(diff, await _item_flags_for(run),
                                               gomode_bot._load_items_received(**_rk(run)))
-                # Prepare to send the message in a code block.
-                # Adjust the maximum content length to account for the code block wrappers.
-                wrapper_length = len("```\n") + len("\n```")
-                max_content_length = 1950 - wrapper_length
-                chunks = chunk_text_by_line(message, max_content_length)
+                # Send it in ansi code blocks that fit Discord's limit, fences and colours included.
+                chunks = ansi_messages(message)
                 channel = _run_channel(channel_id, run)
                 for chunk in (chunks if channel is not None else ()):
-                    await channel.send(f"```ansi\n{chunk}\n```")
+                    await channel.send(chunk)
                 if channel is not None:
                     _log_announced(diff)
                 quiet_cycles = 0
@@ -2157,16 +2177,14 @@ async def get_all_tracked_items(ctx):
         message = await send_items(ctx, assignment, initial_response, run)
         combined_message += f"\n{message}\n"
 
-    # Prepare the message for DM; use plain text code blocks.
-    wrapper_length = len("```ansi\n") + len("\n```")
-    max_content_length = 1950 - wrapper_length
-    chunks = chunk_text_by_line(combined_message, max_content_length)
+    # DM it in ansi blocks that fit Discord's limit.
+    chunks = ansi_messages(combined_message, _dm_prefix(run))
 
 
 
     try:
         for chunk in chunks:
-            await ctx.author.send(_dm_prefix(run) + f"```ansi\n{chunk}\n```")
+            await ctx.author.send(chunk)
         await initial_response.edit_original_response(
             content="I've sent you a DM with a list of items for the slots you are tracking."
         )
@@ -2418,9 +2436,13 @@ async def _run_unstuck_alerts(run=None):
         if new_items:
             # In an ansi block so the item colours show; trimmed to stay under Discord's limit.
             shown = new_items[:15]
-            while len(shown) > 1 and len(msg) + len(", ".join(shown)) + 40 > 1950:
+
+            def block():
+                return "\n" + ANSI_BLOCK_OPEN + "New since then: " + ", ".join(shown) + ANSI_BLOCK_CLOSE
+            while shown and len(msg) + len(block()) > MESSAGE_LIMIT:
                 shown.pop()
-            msg += "\n```ansi\nNew since then: " + ", ".join(shown) + "\n```"
+            if shown:
+                msg += block()
         for user_id in user_ids:
             try:
                 user = await bot.fetch_user(int(user_id))
