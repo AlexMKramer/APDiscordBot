@@ -32,6 +32,7 @@ class SlotData:
     location_ids: set = field(default_factory=set)        # the slot's real location IDs
     prog_item_ids: Counter = field(default_factory=Counter)  # its progression items placed anywhere
     item_flags: dict = field(default_factory=dict)        # item name -> flags of all its copies OR'd
+    sphere_zero: Optional[set] = None  # location IDs in sphere 0 per the seed's own playthrough; None if the seed has none
 
 
 @dataclass
@@ -121,6 +122,11 @@ def load_seed(zip_path: str) -> SeedData:
             per_slot = item_id_flags.setdefault(receiver, {})
             per_slot[item_id] = per_slot.get(item_id, 0) | flags
 
+    # The generator's playthrough sweep: spheres[0] holds, per slot, the locations reachable from the
+    # start. Seeds made without spheres have none, and then sphere 0 is left to the rebuild.
+    spheres = decoded.get("spheres") or []
+    first_sphere = spheres[0] if spheres and isinstance(spheres[0], dict) else None
+
     slots = {}
     for sid, info in slot_info.items():
         sd = slot_data.get(sid, {})
@@ -138,6 +144,7 @@ def load_seed(zip_path: str) -> SeedData:
             location_ids=location_ids.get(sid, set()),
             prog_item_ids=prog_item_ids.get(sid, Counter()),
             item_flags=_names(item_id_flags.get(sid, {}), datapackage.get(game) or {}),
+            sphere_zero=None if first_sphere is None else set(first_sphere.get(sid, ()) or ()),
         )
 
     # The spoiler header carries the generation seed ("Archipelago Version X  -  Seed: N"). With

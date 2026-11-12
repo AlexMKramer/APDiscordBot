@@ -96,6 +96,36 @@ def main(argv=None) -> int:
                                         list_names=bool(request.get("list_names")))
         return {"status": "ok", **counts}
 
+    sphere_zero_cache: dict = {}  # lowercase slot name -> {location id: name}, built on first use
+
+    def sphere_zero(requested: dict) -> dict:
+        """Sphere 0 from the seed's own playthrough (any slot, supported or not); from the rebuild
+        only when the seed has no spheres (then "source" is "rebuild"). Slots with neither report why."""
+        results = {}
+        for name, request in requested.items():
+            try:
+                sd, prepared, result = lookup(name)
+                key = sd.name.lower()
+                if key not in sphere_zero_cache:
+                    id_to_name = {i: n for n, i in sd.datapackage.get("location_name_to_id", {}).items()}
+                    if sd.sphere_zero is not None:
+                        sphere_zero_cache[key] = ("seed", {i: id_to_name.get(i, f"Location {i}")
+                                                           for i in sd.sphere_zero})
+                    elif prepared is not None:
+                        sphere_zero_cache[key] = ("rebuild", engine.sphere_zero_locations(prepared))
+                    else:
+                        sphere_zero_cache[key] = None
+                cached = sphere_zero_cache[key]
+                if cached is None:
+                    results[name] = {"status": result.status, "reason": result.reason}
+                    continue
+                source, zero = cached
+                counts = engine.sphere_zero_checks(prepared, checked_ids(sd, request.get("checked")), zero=zero)
+                results[name] = {"status": "ok", "source": source, **counts}
+            except Exception as exc:  # noqa: BLE001 -- one bad slot must not fail the batch
+                results[name] = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
+        return results
+
     def handle(request: dict):
         op = request.get("op")
         if op == "ping":
@@ -104,6 +134,8 @@ def main(argv=None) -> int:
             return per_slot(request.get("slots") or {}, lambda sd, p, r, inv: go_mode(sd, p, r, inv))
         if op == "checks":
             return per_slot(request.get("slots") or {}, checks)
+        if op == "sphere_zero":
+            return sphere_zero(request.get("slots") or {})
         if op == "analyze":
             sd, prepared, result = lookup(request["slot"])
             if prepared is None:

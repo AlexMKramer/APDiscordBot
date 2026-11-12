@@ -247,6 +247,7 @@ class PreparedSlot:
     templates: dict         # item name -> an Item the rebuild made, for worlds without create_item
     made: dict = field(default_factory=dict)  # item name -> the Item inventory_state copies from
     open_goal: bool = False  # the goal is reachable with no items at all (needs an exact rebuild to trust)
+    start_names: dict = field(default_factory=dict)  # item name -> count held from the start (start inventory)
 
 
 def _make_item(world, name: str, templates: dict):
@@ -353,7 +354,8 @@ def _finish(multiworld, world_type, precollected, pre_filled: bool = False):
 
     return PreparedSlot(multiworld=multiworld, world_type=world_type, universe=universe,
                         prog_names={item.name for item in universe}, templates=templates,
-                        open_goal=open_goal), ""
+                        open_goal=open_goal,
+                        start_names=dict(Counter(item.name for item in start_items))), ""
 
 
 def _run_pre_fill(multiworld, world) -> bool:
@@ -615,6 +617,25 @@ def checks_in_logic(prepared: PreparedSlot, inventory: dict, checked: set, *,
     if list_names:
         counts["to_do"] = sorted(loc.name for loc in reachable if loc.address not in checked)
     return counts
+
+
+def sphere_zero_locations(prepared: PreparedSlot) -> dict:
+    """Sphere 0: the real locations reachable holding only the slot's start inventory (after its
+    event locations are swept, as in checks_in_logic). Returns {location id: name}."""
+    multiworld = prepared.multiworld
+    state, _ = inventory_state(prepared, dict(prepared.start_names))
+    state.sweep_for_advancements(
+        locations=[loc for loc in multiworld.get_locations(1) if loc.address is None])
+    return {loc.address: loc.name for loc in multiworld.get_locations(1)
+            if loc.address is not None and loc.can_reach(state)}
+
+
+def sphere_zero_checks(prepared: Optional[PreparedSlot], checked: set, *, zero: Optional[dict] = None) -> dict:
+    """{total, done, to_do}: the sphere 0 checks, how many are done, and the names of those not
+    done yet (sorted). `checked` holds location IDs; `zero` is a precomputed sphere_zero_locations."""
+    zero = sphere_zero_locations(prepared) if zero is None else zero
+    return {"total": len(zero), "done": sum(1 for a in zero if a in checked),
+            "to_do": sorted(name for a, name in zero.items() if a not in checked)}
 
 
 def most_useful_items(prepared: PreparedSlot, inventory: dict, checked: set, top: int = 5) -> list:

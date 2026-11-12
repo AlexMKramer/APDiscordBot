@@ -1145,6 +1145,84 @@ async def checks_in_logic(ctx, slot_names: str = None):
             content="I hit an error sending the DM — please try again.")
 
 
+def _sphere_zero_message(names, status, unmatched=()):
+    """The /sphere_zero_checks DM text: slots with sphere 0 checks left (count and names), then the
+    slots that can't be checked, then a line for what was skipped."""
+    open_lines, unsupported, other, finished = [], [], [], 0
+    for name in names:
+        st = status.get(name, {})
+        tag = f" ({st['game']})" if st.get("game") else ""
+        kind = st.get("status")
+        if kind == "ok":
+            left = st.get("to_do") or []
+            if not left:
+                finished += 1
+                continue
+            heading = f"**{name}**{tag}: {len(left)} of {st.get('total', 0)} sphere 0 checks left"
+            open_lines.append(heading + "\n" + "\n".join(f"- {check}" for check in left))
+        elif kind == "unsupported":
+            unsupported.append(f"\u2022 {name}{tag}{_why_unsupported(st)}")
+        else:
+            other.append(_checks_line(name, st))
+    rebuilt = [n for n in names if status.get(n, {}).get("status") == "ok" and status[n].get("source") == "rebuild"]
+    lines = ["**Sphere 0 checks not done yet:**"]
+    lines += open_lines if open_lines else ["Every sphere 0 check is done for the slots checked."]
+    if finished and open_lines:
+        lines.append(f"{finished} other slot{'s' if finished != 1 else ''} ha{'ve' if finished != 1 else 's'} done all of theirs.")
+    if unsupported:
+        lines += ["Not supported (can't tell):"] + unsupported
+    lines += other
+    if rebuilt:
+        lines.append(f"The seed has no sphere data, so {', '.join(rebuilt)} "
+                     f"{'was' if len(rebuilt) == 1 else 'were'} worked out from the game's logic instead.")
+    if unmatched:
+        lines.append(f"No slots matched: {', '.join(unmatched)}")
+    return "\n".join(lines)
+
+
+@bot.slash_command(description="Get a DM with the sphere 0 checks (open from the start) nobody has done yet.")
+@option("slot_names", description="Slot names or wildcards like Alex_*, comma-separated. Leave blank for every slot.",
+        autocomplete=slot_names_autocomplete, required=False)
+async def sphere_zero_checks(ctx, slot_names: str = None):
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    rk = _rk(run)
+    initial_response = await ctx.respond("Finding sphere 0 checks...", ephemeral=True)
+
+    cache = gomode_bot.load_cache(**rk)
+    if gomode_bot.load_registry(**rk) is None or not cache:
+        await initial_response.edit_original_response(
+            content="No seed is registered yet. Ask the server owner to run /register_seed.")
+        return
+    unmatched = []
+    if slot_names and slot_names.strip():
+        names, unmatched, problem = _resolve_slot_names(slot_names, cache, str(ctx.author.id), run)
+        if problem:
+            await initial_response.edit_original_response(content=problem)
+            return
+    else:
+        names = [s.get("name") for s in cache.get("slots", {}).values() if s.get("name")]
+    names = _without_goal_completed(names, run)
+    if not names:
+        await initial_response.edit_original_response(content="Every slot you asked about has reached its goal.")
+        return
+    status = await gomode_bot.sphere_zero_checks(names, **rk)
+    names = _unsupported_last(names, status)
+    message = _sphere_zero_message(names, status, unmatched)
+    try:
+        for chunk in chunk_text_by_line(message, 1900):
+            await ctx.author.send(_dm_prefix(run) + chunk)
+        await initial_response.edit_original_response(
+            content=f"Sent you a DM with the sphere 0 checks for {len(names)} slot{'s' if len(names) != 1 else ''}.")
+    except discord.Forbidden:
+        await initial_response.edit_original_response(
+            content="I couldn't DM you — please enable DMs from server members.")
+    except discord.HTTPException:
+        await initial_response.edit_original_response(
+            content="I hit an error sending the DM — please try again.")
+
+
 @bot.slash_command(description="Get a DM listing the checks in logic for a slot that haven't been done yet.")
 @option("slot_name", description="The slot to list checks for.", autocomplete=slot_name_autocomplete, required=True)
 async def which_checks_in_logic(ctx, slot_name: str):

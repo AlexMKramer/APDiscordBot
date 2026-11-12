@@ -29,6 +29,7 @@ These need a registered seed. See [GOMODE.md](GOMODE.md).
 - `/items_to_go_mode [slot_name]`: what you still need to reach your goal. Leave the name empty for all your slots.
 - `/checks_in_logic [slot_names]`: DM with how many checks are in logic. Comma-separated, `*` works.
 - `/which_checks_in_logic slot_name`: DM listing the checks in logic that are not done yet.
+- `/sphere_zero_checks [slot_names]`: DM with the sphere 0 checks (open from the start, using only the start inventory) not done yet, per slot. Blank means every slot in the run; comma-separated, `*` works. Slots with none left are skipped, and unsupported slots are named.
 - `/most_useful_items slot_name`: DM ranking the missing items that would open the most checks.
 - `/unstuck_alerts action [slot_names]`: `on`, `off` or `list`. Sends a DM when a slot that was out of checks in logic gets some again.
 

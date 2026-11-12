@@ -539,6 +539,51 @@ async def checks_in_logic(slot_names, *, items_received: dict | None = None,
     return result
 
 
+async def sphere_zero_checks(slot_names, *, items_received: dict | None = None, run=None) -> dict:
+    """For each slot name, {status, game, reason?} plus, when ok, {total, done, to_do}: the slot's
+    sphere 0 checks (reachable with only its start inventory), how many are done, and the names
+    of those not done yet. One analyzer request for every supported slot."""
+    cache, reg = load_cache(**_rk(run)), load_registry(**_rk(run))
+    if not cache or not reg:
+        return {name: {"status": "unregistered"} for name in slot_names}
+    if items_received is None:
+        items_received = _load_items_received(**_rk(run))
+
+    result: dict = {}
+    batch: dict = {}
+    for name in slot_names:
+        rec = slot_for_name(cache, name)
+        if rec is None:
+            result[name] = {"status": "unregistered"}
+            continue
+        game = rec.get("game")
+        # The seed's own sphere 0 answers for a slot even when its game can't be rebuilt, so a slot
+        # the rebuild doesn't support is still asked; it keeps its status if the seed has no answer.
+        base = ({"status": "error", "game": game, "reason": "no result"} if rec.get("status") == "ok" else
+                {"status": rec.get("status", "error"), "game": game, "reason": rec.get("reason", "")})
+        if not any(name in entry for entry in items_received.values()):
+            result[name] = ({"status": "error", "game": game, "reason": "no tracker data"}
+                            if rec.get("status") == "ok" else base)
+            continue
+        tracker_game = _tracker_game_for_slot(items_received, name)
+        if tracker_game and game and tracker_game.lower() != str(game).lower():
+            result[name] = {"status": "tracker_mismatch", "game": game}
+            continue
+        batch[name] = {"checked": checked_for_slot(items_received, name)}
+        result[name] = base
+
+    if batch:
+        try:
+            found = await worker_for(run).request("sphere_zero", slots=batch)
+        except Exception as e:  # noqa: BLE001 -- slots stay "couldn't check right now"
+            log_error.exception("Sphere 0 analyzer request failed: %s", e)
+            found = {}
+        for name, info in found.items():
+            if name in result and (info.get("status") == "ok" or result[name].get("status") == "error"):
+                result[name] = {**info, "game": result[name].get("game")}
+    return result
+
+
 async def most_useful_items(slot_name: str, *, items_received: dict | None = None,
                             top: int = 5, run=None) -> dict:
     """{status, game, items?: [{"name", "opens"}], reason?}: the missing items that would each
