@@ -24,7 +24,7 @@ PER_RUN_FILES = (
     "slot_info.json", "listeners.json", "items_received.json", "announced_marks.json",
     "hints.json", "hints_pin_state.json", "percentage_state.json", "registered_seed.json",
     "start_inventory.json", "go_mode_notified.json", "unstuck_alerts.json", "unstuck_state.json",
-    "server_address.txt",
+    "server_address.txt", "preferences.json",
 )
 SEED_CACHE_NAME = "seed_cache.json"
 

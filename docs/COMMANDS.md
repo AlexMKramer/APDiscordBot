@@ -19,6 +19,12 @@ Owner only. With more than one run, commands answer for the run linked to the ch
 - `/get_all_tracked_items`: DM with all items for the slots you assigned yourself.
 - `/track_item game_name item_name slot_name target_amount`: DM each time that item arrives, up to the amount you set.
 
+## Preferences
+- `/preferences [progression_color] [useful_color] [trap_color] [filler_color] [reset_all]`: for the bot owner and server administrators (members with Discord's Administrator permission). Shows this run's preferences, and changes the ones you give. Each run has its own.
+  - The colour options take six hex digits, with or without the `#` (`AB57FF`, `#b600fb`). `default` (or `reset`) puts that colour back, and `reset_all` puts every preference back. A value that isn't valid changes nothing.
+  - The colours apply everywhere item names are coloured: the feed, the item DMs, the most useful items list and the go-mode requirement list. Defaults: progression `AB57FF`, useful `6363E4`, trap `DE4040`, filler `5BCEFA`. A colour on its default keeps its own fallback for clients without truecolor (magenta, blue, red and cyan); a custom colour falls back to the nearest of Discord's eight colours.
+  - With no options it only shows the current values.
+
 ## Hints
 - `/hint slot_name item [password]`: asks the Archipelago server for a hint, which spends that slot's hint points. Allowed for the bot owner and for whoever assigned that slot. The password is not stored.
 - The bot also keeps a pinned message in the feed channel listing every unfound hint.

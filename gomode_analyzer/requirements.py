@@ -46,27 +46,57 @@ def satisfies(node: dict, held: dict) -> bool:
 
 
 # Item colours, shared with the bot so both colour items the same way. Classification bits are
-# Archipelago's own: 1 progression, 2 useful, 4 trap. Each is bold, then a named colour for clients
-# without truecolor, then the exact RGB shade (38;2;R;G;B), which wins where it is supported.
-ANSI_PROGRESSION = "\x1b[1;35;38;2;171;87;255m"  # #AB57FF
-ANSI_USEFUL = "\x1b[1;34;38;2;64;64;222m"       # #4040DE
-ANSI_TRAP = "\x1b[1;31;38;2;222;64;64m"         # #DE4040
-ANSI_RESET = "\x1b[0m"
+# Archipelago's own: 1 progression, 2 useful, 4 trap; a known item with none of them is filler.
+# Each colour is bold, then the nearest of Discord's eight named colours for clients without
+# truecolor, then the exact RGB shade (38;2;R;G;B), which wins where it is supported.
+DEFAULT_PALETTE = {"progression": "AB57FF", "useful": "6363E4", "trap": "DE4040", "filler": "5BCEFA"}
+
+# Discord's ANSI foreground colours: SGR code -> the RGB its dark theme draws.
+_DISCORD_ANSI = {30: (0x4F, 0x54, 0x5C), 31: (0xDC, 0x32, 0x2F), 32: (0x85, 0x99, 0x00), 33: (0xB5, 0x89, 0x00),
+                 34: (0x26, 0x8B, 0xD2), 35: (0xD3, 0x36, 0x82), 36: (0x2A, 0xA1, 0x98), 37: (0xFF, 0xFF, 0xFF)}
 
 
-def colour_item(name: str, flags) -> str:
-    """The item name in its classification's colour; unknown or filler stays plain."""
+# The named colour each category uses while it is on its default shade.
+DEFAULT_NAMED = {"progression": 35, "useful": 34, "trap": 31, "filler": 36}
+
+
+def ansi_code(hex_colour: str, named: int | None = None) -> str:
+    """The escape code for a six-digit hex colour: bold, a named colour (the one given, else the
+    nearest of Discord's eight), then the exact RGB."""
+    r, g, b = (int(hex_colour[i:i + 2], 16) for i in (0, 2, 4))
+    if named is None:
+        named = min(_DISCORD_ANSI, key=lambda n: sum((c - d) ** 2 for c, d in zip((r, g, b), _DISCORD_ANSI[n])))
+    return f"[1;{named};38;2;{r};{g};{b}m"
+
+
+def category_code(kind: str, hex_colour: str | None = None) -> str:
+    """The escape code for progression/useful/trap/filler. On its default shade (or none given) the
+    category keeps its fixed named colour; a custom shade gets the nearest named colour."""
+    hex_colour = (hex_colour or DEFAULT_PALETTE[kind]).upper()
+    return ansi_code(hex_colour, DEFAULT_NAMED[kind] if hex_colour == DEFAULT_PALETTE[kind] else None)
+
+
+ANSI_PROGRESSION = category_code("progression")
+ANSI_USEFUL = category_code("useful")
+ANSI_TRAP = category_code("trap")
+ANSI_FILLER = category_code("filler")
+ANSI_RESET = "[0m"
+
+
+def colour_item(name: str, flags, palette: dict | None = None) -> str:
+    """The item name in its classification's colour. palette maps progression/useful/trap/filler to
+    six-digit hex (missing entries use the defaults); a name with unknown flags stays plain."""
     if not isinstance(flags, int):
         return name
-    code = ANSI_PROGRESSION if flags & 1 else ANSI_USEFUL if flags & 2 else ANSI_TRAP if flags & 4 else None
-    return name if code is None else f"{code}{name}{ANSI_RESET}"
+    kind = "progression" if flags & 1 else "useful" if flags & 2 else "trap" if flags & 4 else "filler"
+    return f"{category_code(kind, (palette or {}).get(kind))}{name}{ANSI_RESET}"
 
 
-def colouring(flags: dict):
+def colouring(flags: dict, palette: dict | None = None):
     """An item-name formatter that wraps a name in its classification's ANSI colour (by the seed's
-    flags); unknown and filler names stay plain."""
+    flags); names with unknown flags stay plain."""
     def nm(name):
-        return colour_item(name, flags.get(name))
+        return colour_item(name, flags.get(name), palette)
     return nm
 
 

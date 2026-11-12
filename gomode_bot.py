@@ -631,13 +631,15 @@ async def go_mode_status(slot_names, *, items_received: dict | None = None, run=
 
 
 async def analyze_slot_live(slot_name: str, inventory: dict, colour: bool = False, run=None,
-                            checked: list | None = None) -> dict | None:
+                            checked: list | None = None, palette: dict | None = None) -> dict | None:
     """Full on-demand analysis of one slot for the player's current inventory (and checked
     location names, when given). Returns the analysis dict (incl. `requirements_text`), or None
     if no seed is registered."""
     if load_registry(**_rk(run)) is None:
         return None
     extra = {} if checked is None else {"checked": checked}
+    if palette:
+        extra["palette"] = palette
     try:
         return await worker_for(run).request("analyze", slot=slot_name, inventory=inventory, colour=colour, **extra)
     except Exception as e:  # noqa: BLE001

@@ -153,7 +153,7 @@ def main(argv=None) -> int:
             output = {**res.to_dict(), "seed": seed.seed_name, "version": seed.version_str}
             if res.status == "ok" and not res.in_go_mode:
                 output["requirements_text"] = requirements.render_requirements(
-                    res.requirements, requirements.colouring(sd.item_flags) if request.get("colour") else str)
+                    res.requirements, requirements.colouring(sd.item_flags, request.get("palette")) if request.get("colour") else str)
             return output
         if op == "useful_items":
             sd, prepared, result = lookup(request["slot"])

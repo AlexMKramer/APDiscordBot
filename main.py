@@ -21,6 +21,7 @@ import platform
 import re
 from urllib.parse import urlparse
 from gomode_analyzer.requirements import colour_item
+import preferences as run_prefs
 
 dotenv.load_dotenv()
 log_path = log_setup.setup()
@@ -69,6 +70,14 @@ def is_owner(ctx) -> bool:
         return str(ctx.author.id) == str(gomode_owner_id)
     guild = getattr(ctx, "guild", None)
     return bool(guild and ctx.author.id == guild.owner_id)
+
+def is_owner_or_admin(ctx) -> bool:
+    """The bot owner, or a member with the Administrator permission in the guild the command ran in."""
+    if is_owner(ctx):
+        return True
+    perms = getattr(ctx.author, "guild_permissions", None)
+    return bool(getattr(ctx, "guild", None) and perms is not None and getattr(perms, "administrator", False))
+
 
 # This enables users to interact with our bot as soon as it connects to the server.
 intents = discord.Intents.default()
@@ -883,6 +892,59 @@ async def list_runs(ctx):
 
 
 
+def _preferences_reply(run, notes=()) -> str:
+    """The run's preferences as an ansi block (colour settings drawn in their colour), after any notes."""
+    head = "\n".join(notes) + "\n\n" if notes else ""
+    body = "\n".join(run_prefs.summary_lines(run))
+    title = f"Preferences for {run.name}:" if run else "Preferences:"
+    return f"{head}{title}\n{ANSI_BLOCK_OPEN}{body}{ANSI_BLOCK_CLOSE}"
+
+
+@bot.slash_command(name="preferences",
+                   description="(Admin) Show or change this run's preferences, such as the item colours.")
+@option("progression_color", description="Hex colour for progression items, e.g. AB57FF. 'default' puts it back.",
+        required=False)
+@option("useful_color", description="Hex colour for useful items, e.g. 6363E4. 'default' puts it back.", required=False)
+@option("trap_color", description="Hex colour for trap items, e.g. DE4040. 'default' puts it back.", required=False)
+@option("filler_color", description="Hex colour for filler items, e.g. 5BCEFA. 'default' puts it back.", required=False)
+@option("reset_all", description="Put every preference back to its default.", required=False)
+async def preferences_command(ctx, progression_color: str = None, useful_color: str = None,
+                              trap_color: str = None, filler_color: str = None, reset_all: bool = False):
+    if not is_owner_or_admin(ctx):
+        await ctx.respond("Only the bot owner or a server administrator can change preferences.", ephemeral=True)
+        return
+    run, ok = await _gate(ctx)
+    if not ok:
+        return
+    asked = {"color_progression": progression_color, "color_useful": useful_color,
+             "color_trap": trap_color, "color_filler": filler_color}
+    changes, problems = {}, []
+    if reset_all:
+        changes = {s.key: None for s in run_prefs.SETTINGS}
+    for key, text in asked.items():
+        if text is None or not str(text).strip():
+            continue
+        try:
+            changes[key] = None if run_prefs.is_reset(text) else run_prefs.parse_value(run_prefs.BY_KEY[key], text)
+        except ValueError as e:
+            problems.append(str(e))
+    if problems:
+        await ctx.respond("\n".join(problems) + "\nNothing was changed.", ephemeral=True)
+        return
+    notes = ()
+    if changes:
+        try:
+            run_prefs.save(changes, **_rk(run))
+        except OSError as e:
+            log_error.exception("Could not save preferences: %s", e)
+            await ctx.respond("I couldn't save the preferences. Nothing was changed.", ephemeral=True)
+            return
+        notes = ("Saved.",)
+        log_cmd.info("Preferences changed for %s: %s", run.name if run else "the run",
+                                       ", ".join(sorted(changes)))
+    await ctx.respond(_preferences_reply(run, notes), ephemeral=True)
+
+
 def _load_listeners(run=None) -> dict:
     try:
         with open(runs.run_path("listeners.json", run), "r") as f:
@@ -924,7 +986,8 @@ async def _send_go_mode_detail(ctx, initial_response, slot_name: str, run=None):
     rk = _rk(run)
     inventory = gomode_bot.current_inventory(slot_name, **rk)
     res = await gomode_bot.analyze_slot_live(slot_name, inventory, colour=True,
-                                             checked=gomode_bot.current_checked(slot_name, **rk), **rk)
+                                             checked=gomode_bot.current_checked(slot_name, **rk),
+                                             palette=_palette(run), **rk)
     if res is None:
         await initial_response.edit_original_response(
             content="No seed is registered yet. Ask the server owner to run /register_seed.")
@@ -1302,7 +1365,7 @@ async def most_useful_items(ctx, slot_name: str):
         flag_map = gomode_bot.slot_item_flags(await _item_flags_for(run), gomode_bot._load_items_received(**rk), name)
         lines = [f"{ANSI_UNDERLINE}Most useful items for {name}{tag}:{ANSI_RESET}"]
         for rank, item in enumerate(st["items"], 1):
-            lines.append(f"{rank}. {colorize_item(item['name'], flag_map.get(item['name']))}"
+            lines.append(f"{rank}. {colorize_item(item['name'], flag_map.get(item['name']), _palette(run))}"
                          f" — opens {item['opens']} check{'s' if item['opens'] != 1 else ''}")
         message = "\n".join(lines)
         use_ansi = True
@@ -1586,7 +1649,7 @@ async def get_all_new_items(ctx):
 
             diff_message_lines.append(header)
             for item_name, diff_amount in diff_items.items():
-                diff_message_lines.append(item_line(item_name, diff_amount, flag_map.get(item_name), plus=True))
+                diff_message_lines.append(item_line(item_name, diff_amount, flag_map.get(item_name), plus=True, palette=_palette(run)))
             diff_message_lines.append("")  # blank line for separation
             # Update seen items to the current aggregated totals.
             for item_name, new_total in agg_new.items():
@@ -1700,7 +1763,7 @@ async def get_new_items_for_slot(ctx, slot_name: str):
 
             diff_message_lines.append(header)
             for item_name, diff_amount in diff_items.items():
-                diff_message_lines.append(item_line(item_name, diff_amount, flag_map.get(item_name), plus=True))
+                diff_message_lines.append(item_line(item_name, diff_amount, flag_map.get(item_name), plus=True, palette=_palette(run)))
             diff_message_lines.append("")
             for item_name, new_total in agg_new.items():
                 seen_items[item_name] = new_total
@@ -1838,7 +1901,7 @@ async def send_items(ctx, assignment, initial_response, run=None):
     for key, item_info in items_dict.items():
         item_name = item_info.get("item_name", "Unknown")
         amount = item_info.get("amount", "Unknown")
-        lines.append(item_line(item_name, amount, flag_map.get(item_name)))
+        lines.append(item_line(item_name, amount, flag_map.get(item_name), palette=_palette(run)))
 
     message = "\n".join(lines)
     return message
@@ -1859,18 +1922,28 @@ ANSI_RESET = "[0m"
 ANSI_UNDERLINE = "[4;2m"
 # Item colours (progression, useful, trap) come from gomode_analyzer.requirements, which colours the
 # go-mode requirement tree the same way.
-def colorize_item(name, flags):
-    """The item name in its classification's colour; unknown or filler stays plain."""
-    return colour_item(name, flags)
+def colorize_item(name, flags, palette=None):
+    """The item name in its classification's colour (the run's palette, or the defaults); an item
+    whose classification isn't known stays plain."""
+    return colour_item(name, flags, palette)
 
 
-def item_line(name, count, flags, plus=False):
+def _palette(run=None):
+    """The run's item colours; the defaults when its preferences can't be read."""
+    try:
+        return run_prefs.palette(run)
+    except Exception as e:
+        log_error.exception("Could not load item colour preferences: %s", e)
+        return {}
+
+
+def item_line(name, count, flags, plus=False, palette=None):
     """'Name' for one item, 'Name +N' (new items) or 'Name xN' (running totals) for more."""
     try:
         many = int(count) > 1
     except (TypeError, ValueError):
         many = True
-    text = colorize_item(name, flags)
+    text = colorize_item(name, flags, palette)
     if many:
         text += f" +{count}" if plus else f" x{count}"
     return text
@@ -1885,7 +1958,7 @@ async def _item_flags_for(run=None):
         return {}
 
 
-def format_diff_message(diff, item_flags=None, items_received=None):
+def format_diff_message(diff, item_flags=None, items_received=None, palette=None):
     lines = []
 
     # Underline the slot name using ANSI escape sequences
@@ -1910,7 +1983,7 @@ def format_diff_message(diff, item_flags=None, items_received=None):
         lines.append(f"{underline_start}{slot_name}:{underline_end}")
         flag_map = gomode_bot.slot_item_flags(item_flags, items_received, slot_name)
         for item_name, change in new_items.items():
-            lines.append(item_line(item_name, change, flag_map.get(item_name), plus=True))
+            lines.append(item_line(item_name, change, flag_map.get(item_name), plus=True, palette=palette))
         lines.append("")  # blank line for separation
     return "\n".join(lines)
 
@@ -2008,7 +2081,7 @@ async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
                     log_feed.info("Only filler items received, nothing posted")
             if diff:
                 message = format_diff_message(diff, await _item_flags_for(run),
-                                              gomode_bot._load_items_received(**_rk(run)))
+                                              gomode_bot._load_items_received(**_rk(run)), _palette(run))
                 # Send it in ansi code blocks that fit Discord's limit, fences and colours included.
                 chunks = ansi_messages(message)
                 channel = _run_channel(channel_id, run)
@@ -2408,6 +2481,7 @@ async def _run_unstuck_alerts(run=None):
     status = await gomode_bot.checks_in_logic(list(slot_to_users), items_received=items_received, **_rk(run))
     state = gomode_bot.load_unstuck_state(seed, **_rk(run))
     item_flags = await gomode_bot.load_item_flags(**_rk(run)) or {}
+    palette = _palette(run)
     changed = False
     for name, user_ids in slot_to_users.items():
         st = status.get(name, {})
@@ -2427,7 +2501,7 @@ async def _run_unstuck_alerts(run=None):
 
         before = previous.get("inventory", {})
         flags = (item_flags.get(name) or {}).get("items", {})
-        new_items = [item_line(item, count - before.get(item, 0), flags.get(item), plus=True)
+        new_items = [item_line(item, count - before.get(item, 0), flags.get(item), plus=True, palette=palette)
                      for item, count in inventory.items()
                      if count > before.get(item, 0) and flags.get(item) != 0]
         game = st.get("game") or ""
