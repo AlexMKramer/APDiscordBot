@@ -8,7 +8,8 @@ options dataclass and convert each value string back with the option's own
 `from_any`/`from_text`.
 
 Scalar options (Toggle / Choice / Range / FreeText and subclasses) convert back with the
-option's own converters. Dict, list and set options are parsed from their joined text and
+option's own converters. Dict, list and set options are parsed from their joined text (a dict's
+values may themselves be dicts or lists, as YAYARG's song pools are) and
 kept only if they render back to exactly what the spoiler wrote, so an ambiguous parse is
 dropped rather than guessed. They matter even when they don't gate logic directly: a world
 that draws randomly from one (e.g. weighted minigames) has to see the real value for the
@@ -61,22 +62,90 @@ def _scalar(text: str):
     return int(text) if re.fullmatch(r"-?\d+", text) else text
 
 
+def _top_level(text: str, sep: str) -> list | None:
+    """Split `text` on `sep` only outside brackets and quotes (a dict option's values can be
+    dicts or lists, written as Python reprs). None if the brackets or quotes don't balance."""
+    parts, depth, quote, start, i = [], 0, None, 0, 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "{[(":
+            depth += 1
+        elif ch in "}])":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and text.startswith(sep, i):
+            parts.append(text[start:i])
+            i += len(sep)
+            start = i
+            continue
+        i += 1
+    if depth or quote:
+        return None
+    parts.append(text[start:])
+    return parts
+
+
+def _nested_dict(raw: str) -> dict | None:
+    """A dict option whose values are dicts or lists ("Guitar: {'amount_in_pool': 60, ...}")."""
+    import ast
+
+    value = {}
+    for part in _top_level(raw, ", ") or [None]:
+        pieces = _top_level(part, ": ") if part else None
+        if not pieces or len(pieces) < 2:
+            return None
+        key, val = ": ".join(pieces[:-1]), pieces[-1]
+        if val[:1] in "{[('\"":
+            try:
+                value[key] = ast.literal_eval(val)
+            except (ValueError, SyntaxError):
+                return None
+        else:
+            value[key] = _scalar(val)
+    return value
+
+
 def _parse_collection(opt_cls, raw: str):
     """Parse a dict/list/set option from its spoiler text, or None if it doesn't round-trip."""
-    from Options import OptionDict, OptionList
+    from Options import OptionDict
+
+    if issubclass(opt_cls, OptionDict):
+        value = _checked(opt_cls, raw, _flat_dict(raw))
+        if value is None and raw:
+            value = _checked(opt_cls, raw, _nested_dict(raw))
+        return value
+    return _checked(opt_cls, raw, _flat_list(opt_cls, raw))
+
+
+def _flat_dict(raw: str) -> dict | None:
+    value = {}
+    for part in (raw.split(", ") if raw else []):
+        if ": " not in part:
+            return None
+        key, val = part.rsplit(": ", 1)
+        value[key] = _scalar(val)
+    return value
+
+
+def _flat_list(opt_cls, raw: str):
+    from Options import OptionList
 
     parts = raw.split(", ") if raw else []
-    if issubclass(opt_cls, OptionDict):
-        value = {}
-        for part in parts:
-            if ": " not in part:
-                return None
-            key, val = part.rsplit(": ", 1)
-            value[key] = _scalar(val)
-    elif issubclass(opt_cls, OptionList):
-        value = list(parts)
-    else:
-        value = set(parts)
+    return list(parts) if issubclass(opt_cls, OptionList) else set(parts)
+
+
+def _checked(opt_cls, raw: str, value):
+    """`value` if it is valid for the option and renders back to exactly `raw`, else None."""
+    if value is None:
+        return None
     valid = getattr(opt_cls, "valid_keys", None)
     if valid and any(key not in valid for key in value):
         return None

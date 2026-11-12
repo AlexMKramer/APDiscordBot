@@ -9,7 +9,9 @@ Runs in PLAIN Python (no Archipelago import needed) so the bot can trigger it on
      git checkout (`git archive <tag>`, fast, no network) or by downloading the GitHub
      release source zip.
   3. Installs the host-supplied apworlds into the tree's custom_worlds/.
-  4. Writes a manifest the analyzer/bot reads to know the AP path + version.
+  4. Writes the spoiler's values back into Players/ for worlds that build their data from the
+     player yamls there (YAYARG's song lists).
+  5. Writes a manifest the analyzer/bot reads to know the AP path + version.
 
 Building a Python venv with the right dependencies is intentionally left as an explicit
 step (`--build-venv`) because dependency needs vary by host; by default the caller points
@@ -161,6 +163,52 @@ def install_apworlds(apworlds_src: str, ap_path: str) -> tuple[list[str], list[s
     return installed, skipped
 
 
+# Worlds that build their item and location tables when imported, from the player yamls in the
+# generator's Players/ folder: {game: {spoiler display name: yaml option key}}. Without the same
+# values the world's data differs from the seed's, so the seed's own values are written back there.
+PLAYER_YAML_OPTIONS = {
+    "YAYARG": {"Song List": "songList"},
+}
+PLAYER_YAML = "gomode_slots.yaml"
+
+
+def write_player_yamls(seed_zip: str, ap_path: str) -> list[str]:
+    """Write <ap_path>/Players/gomode_slots.yaml with one document per slot of a game in
+    PLAYER_YAML_OPTIONS, holding the options that game reads from player yamls, as the seed's
+    spoiler gives them. Documents follow slot order, which is the order the generator read its
+    yamls in (both walk the same folder), so worlds that number their items as they read them
+    number them the same way. Replaces the file an earlier registration wrote; writes nothing
+    when no slot needs it. Returns the slot names written."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import spoiler_options  # pure text parsing, no AP needed
+
+    players_dir = os.path.join(ap_path, "Players")
+    path = os.path.join(players_dir, PLAYER_YAML)
+    if os.path.exists(path):
+        os.remove(path)
+    with zipfile.ZipFile(seed_zip) as zf:
+        sp = next((n for n in zf.namelist() if n.endswith("_Spoiler.txt")), None)
+        spoiler = zf.read(sp).decode("utf-8-sig", "replace") if sp else None
+    docs, names = [], []
+    for slot, block in sorted(spoiler_options.parse_player_blocks(spoiler).items()):
+        settings = block["settings"]
+        game = settings.get("Game")
+        section = {key: settings[shown] for shown, key in PLAYER_YAML_OPTIONS.get(game, {}).items()
+                   if settings.get(shown)}
+        if not section:
+            continue
+        # JSON is valid YAML, and needs no YAML library in this plain-Python step.
+        docs.append(json.dumps({"name": block["name"], "game": game, game: section}, ensure_ascii=False))
+        names.append(block["name"])
+    if docs:
+        os.makedirs(players_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n---\n".join(docs) + "\n")
+    return names
+
+
 def provision(seed_zip: str, runtime_dir: str, *, apworlds_src: str | None = None,
               ap_repo: str | None = None) -> dict:
     version = detect_version(seed_zip)
@@ -168,6 +216,8 @@ def provision(seed_zip: str, runtime_dir: str, *, apworlds_src: str | None = Non
     ap_path = os.path.join(runtime_dir, f"ap-{tag}")
     materialize_ap_source(version, ap_path, ap_repo=ap_repo)
     installed, skipped = install_apworlds(apworlds_src, ap_path) if apworlds_src else ([], [])
+    # Before anything imports the worlds: the precompute and the analyzer both load them from this tree.
+    player_yamls = write_player_yamls(seed_zip, ap_path)
 
     # AP fills in host.yaml on its first run. Without one, the first process to load the worlds
     # has no settings for them (Powerwash Simulator fails to build), so start from an empty file.
@@ -182,6 +232,7 @@ def provision(seed_zip: str, runtime_dir: str, *, apworlds_src: str | None = Non
         "ap_path": os.path.abspath(ap_path),
         "apworlds_installed": sorted(installed),
         "apworlds_skipped_no_source": sorted(skipped),
+        "player_yamls": player_yamls,
     }
     os.makedirs(runtime_dir, exist_ok=True)
     with open(os.path.join(runtime_dir, "manifest.json"), "w", encoding="utf-8") as fh:
