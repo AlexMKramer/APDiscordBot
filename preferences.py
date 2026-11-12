@@ -12,6 +12,7 @@ import json
 import os
 import re
 
+import quiet_hours
 import runs
 from gomode_analyzer.requirements import DEFAULT_PALETTE, category_code, ANSI_RESET
 
@@ -23,7 +24,7 @@ _RESET_WORDS = {"default", "reset"}
 @dataclasses.dataclass(frozen=True)
 class Setting:
     key: str          # name in the file and in the command
-    kind: str         # "colour" (six-digit hex) or "bool"
+    kind: str         # "colour" (six-digit hex), "bool", "time" (HH:MM) or "zone" (IANA time zone name)
     default: object
     label: str        # how the summary names it
     help: str = ""
@@ -41,6 +42,9 @@ SETTINGS = (
             "Post filler items in the item thread, in the filler colour. Off hides them."),
     Setting("hide_traps", "bool", False, "Hide trap items in the feed",
             "Leave trap items out of the item thread. Off posts them."),
+    Setting("quiet_start", "time", None, "Quiet hours start", "When the bot starts holding its automatic DMs."),
+    Setting("quiet_end", "time", None, "Quiet hours end", "When the held DMs are sent."),
+    Setting("timezone", "zone", quiet_hours.DEFAULT_ZONE, "Quiet hours time zone", "IANA name, e.g. America/New_York."),
 )
 BY_KEY = {s.key: s for s in SETTINGS}
 
@@ -63,11 +67,26 @@ def parse_value(setting: Setting, text):
         if word in ("off", "false", "no", "0"):
             return False
         raise ValueError(f"{setting.label}: use on or off.")
+    if setting.kind == "time":
+        return quiet_hours.parse_time(text)
+    if setting.kind == "zone":
+        return quiet_hours.parse_zone(text)
     raise ValueError(f"unknown setting kind {setting.kind!r}")
 
 
 def is_reset(text) -> bool:
     return isinstance(text, str) and text.strip().lower() in _RESET_WORDS
+
+
+def is_off(text) -> bool:
+    """'off' (for the quiet hours options): clear the setting."""
+    return isinstance(text, str) and text.strip().lower() == "off"
+
+
+def quiet_window(run=None):
+    """The run's quiet hours as quiet_hours.window() takes them: None when off or incomplete."""
+    v = values(run)
+    return quiet_hours.window(v["quiet_start"], v["quiet_end"], v["timezone"])
 
 
 def _path(run=None) -> str:
@@ -132,9 +151,18 @@ def summary_lines(run=None) -> list:
     lines = []
     for s in SETTINGS:
         value = v[s.key]
+        if s.kind in ("time", "zone"):
+            continue
         if s.kind == "colour":
             shown = f"{category_code(s.key[len('color_'):], value)}#{value}{ANSI_RESET}"
         else:
             shown = "on" if value else "off"
         lines.append(f"{s.label}: {shown}" + ("" if s.key in saved else " (default)"))
+    if quiet_window(run):
+        lines.append(f"Quiet hours (DMs held): {v['quiet_start']} to {v['quiet_end']} {v['timezone']}")
+    elif v["quiet_start"] or v["quiet_end"]:
+        lines.append(f"Quiet hours (DMs held): off, set both a start ({v['quiet_start'] or 'missing'}) "
+                     f"and an end ({v['quiet_end'] or 'missing'}) to turn them on")
+    else:
+        lines.append("Quiet hours (DMs held): off (default)")
     return lines

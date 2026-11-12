@@ -22,6 +22,7 @@ import re
 from urllib.parse import urlparse
 from gomode_analyzer.requirements import colour_item
 import preferences as run_prefs
+import quiet_hours
 
 dotenv.load_dotenv()
 log_path = log_setup.setup()
@@ -254,6 +255,7 @@ def start_run(run=None):
 
     log_start.info("Starting the unstuck alert loop%s", label)
     spawn(check_unstuck_loop(**_rk(run)))
+    spawn(held_dms_loop(**_rk(run)))
 
     # Build every slot of the registered seed now, so the first command doesn't wait on it
     # (a run with no registered seed starts nothing).
@@ -911,10 +913,16 @@ def _preferences_reply(run, notes=()) -> str:
         required=False)
 @option("hide_traps", description="Leave trap items out of the item thread. Off (the default) posts them.",
         required=False)
+@option("quiet_start", description="Quiet hours start, 24-hour HH:MM, e.g. 22:00. 'off' clears the quiet hours.",
+        required=False)
+@option("quiet_end", description="Quiet hours end, 24-hour HH:MM, e.g. 07:00. 'off' clears the quiet hours.",
+        required=False)
+@option("timezone", description="Time zone for the quiet hours, e.g. America/New_York. Default UTC.", required=False)
 @option("reset_all", description="Put every preference back to its default.", required=False)
 async def preferences_command(ctx, progression_color: str = None, useful_color: str = None,
                               trap_color: str = None, filler_color: str = None, show_filler: bool = None,
-                              hide_traps: bool = None, reset_all: bool = False):
+                              hide_traps: bool = None, quiet_start: str = None, quiet_end: str = None,
+                              timezone: str = None, reset_all: bool = False):
     if not is_owner_or_admin(ctx):
         await ctx.respond("Only the bot owner or a server administrator can change preferences.", ephemeral=True)
         return
@@ -923,7 +931,8 @@ async def preferences_command(ctx, progression_color: str = None, useful_color: 
         return
     asked = {"color_progression": progression_color, "color_useful": useful_color,
              "color_trap": trap_color, "color_filler": filler_color, "show_filler": show_filler,
-             "hide_traps": hide_traps}
+             "hide_traps": hide_traps, "quiet_start": quiet_start, "quiet_end": quiet_end,
+             "timezone": timezone}
     changes, problems = {}, []
     if reset_all:
         changes = {s.key: None for s in run_prefs.SETTINGS}
@@ -931,9 +940,19 @@ async def preferences_command(ctx, progression_color: str = None, useful_color: 
         if text is None or not str(text).strip():
             continue
         try:
-            changes[key] = None if run_prefs.is_reset(text) else run_prefs.parse_value(run_prefs.BY_KEY[key], text)
+            if key in ("quiet_start", "quiet_end") and run_prefs.is_off(text):
+                changes["quiet_start"] = changes["quiet_end"] = None      # off clears the whole window
+            elif run_prefs.is_reset(text) or (key == "timezone" and run_prefs.is_off(text)):
+                changes[key] = None
+            else:
+                changes[key] = run_prefs.parse_value(run_prefs.BY_KEY[key], text)
         except ValueError as e:
             problems.append(str(e))
+    if not problems:
+        after = {**run_prefs.values(run), **{k: (run_prefs.BY_KEY[k].default if v is None else v)
+                                              for k, v in changes.items()}}
+        if after["quiet_start"] and after["quiet_start"] == after["quiet_end"]:
+            problems.append("The quiet hours start and end are the same time. Pick two different times.")
     if problems:
         await ctx.respond("\n".join(problems) + "\nNothing was changed.", ephemeral=True)
         return
@@ -2453,7 +2472,7 @@ async def _run_tracked_items_check(run=None):
             try:
                 user_obj = await bot.fetch_user(int(user_id))
                 if user_obj:
-                    await user_obj.send("\n".join(prefix + m for m in user_messages))
+                    await _deliver_dm(user_obj, "\n".join(prefix + m for m in user_messages), run)
             except discord.Forbidden:
                 log_error.warning("Could not DM Discord user %s about a tracked item (DMs disabled)", user_id)
             except Exception as e:
@@ -2463,6 +2482,63 @@ async def _run_tracked_items_check(run=None):
     if any_update:
         with open(listeners_data_json, "w") as f:
             json.dump(listeners_data, f, indent=4)
+
+
+async def _deliver_dm(user, content, run=None):
+    """Send one of the bot's automatic DMs, or hold it while the run's quiet hours are on. A held DM is
+    kept in the run's held_dms.json and sent by held_dms_loop once the quiet hours end. Counts as
+    delivered for the caller either way; a failure to send right away is raised as before."""
+    try:
+        quiet = quiet_hours.in_window(run_prefs.quiet_window(run))
+    except Exception as e:  # noqa: BLE001 - never lose a DM over an unreadable preference
+        log_error.exception("Could not read the quiet hours: %s", e)
+        quiet = False
+    if quiet:
+        try:
+            quiet_hours.hold(user.id, content, run)
+            log_cmd.info("Held a DM for %s until the quiet hours end%s", getattr(user, "name", user.id),
+                         f" ({run.name})" if run else "")
+            return
+        except OSError as e:
+            log_error.exception("Could not hold a DM, sending it now: %s", e)
+    await user.send(content)
+
+
+async def _send_held_dms(run=None):
+    """Send the DMs held for this run, unless the quiet hours are on again. Returns how many were sent."""
+    if quiet_hours.in_window(run_prefs.quiet_window(run)):
+        return 0
+    held = quiet_hours.load(run)
+    done, sent = [], 0
+    for entry in held:
+        try:
+            user = await bot.fetch_user(int(entry["user_id"]))
+            await user.send(entry["content"])
+            sent += 1
+            done.append(entry["id"])
+        except discord.Forbidden:
+            log_error.warning("Could not send a held DM to Discord user %s (DMs disabled)", entry["user_id"])
+            done.append(entry["id"])     # they can't receive it: no point trying again
+        except Exception as e:  # noqa: BLE001 - kept, tried again next time
+            log_error.exception("Could not send a held DM to Discord user %s: %s", entry["user_id"], e)
+    quiet_hours.remove(done, run)
+    if sent:
+        log_cmd.info("Sent %d DM%s held during the quiet hours", sent, "s" if sent != 1 else "")
+    return sent
+
+
+HELD_DM_CHECK_SECONDS = 30
+
+
+async def held_dms_loop(run=None):
+    """Sends the DMs held during quiet hours once they end (and any left from before a restart)."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await _send_held_dms(run)
+        except Exception as e:  # never let one bad cycle kill the loop
+            log_error.exception("Held DM check failed: %s", e)
+        await asyncio.sleep(HELD_DM_CHECK_SECONDS)
 
 
 async def check_unstuck_loop(run=None):
@@ -2534,7 +2610,7 @@ async def _run_unstuck_alerts(run=None):
             try:
                 user = await bot.fetch_user(int(user_id))
                 if user:
-                    await user.send(msg)
+                    await _deliver_dm(user, msg, run)
                     log_goal.info("Told %s that %s has checks in logic again", getattr(user, "name", user_id), name)
             except discord.Forbidden:
                 log_error.warning("Could not DM Discord user %s the unstuck alert for %s (DMs disabled)", user_id, name)
@@ -2641,7 +2717,7 @@ async def _run_go_mode_notifications(run=None):
             try:
                 user = await bot.fetch_user(int(author_id))
                 if user:
-                    await user.send(msg)
+                    await _deliver_dm(user, msg, run)
                     # Mark notified ONLY after the DM actually sends, so a closed-DM/transient
                     # failure is retried next cycle instead of being silently lost.
                     notified.add(tok(author_id, sn))

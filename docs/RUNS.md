@@ -74,7 +74,7 @@ a game's apworld need their own copies.
 | Path | What |
 |------|------|
 | `data/runs.json` | The list of runs (name, channel, tracker, server address, active). |
-| `data/runs/<run>/` | One run's own files: `slot_info.json`, `listeners.json`, `items_received.json`, `announced_marks.json`, `hints.json`, `hints_pin_state.json`, `percentage_state.json`, `registered_seed.json`, `start_inventory.json`, `go_mode_notified.json`, `unstuck_alerts.json`, `unstuck_state.json`, `server_address.txt`, `preferences.json` (only the values that differ from the defaults; see `/preferences`). |
+| `data/runs/<run>/` | One run's own files: `slot_info.json`, `listeners.json`, `items_received.json`, `announced_marks.json`, `hints.json`, `hints_pin_state.json`, `percentage_state.json`, `registered_seed.json`, `start_inventory.json`, `go_mode_notified.json`, `unstuck_alerts.json`, `unstuck_state.json`, `server_address.txt`, `held_dms.json` (DMs held during quiet hours, until they are sent), `preferences.json` (only the values that differ from the defaults; see `/preferences`). |
 | `gomode_analyzer/runtime/<run>/` | The run's go-mode seed cache, Archipelago tree and manifest (under `GOMODE_RUNTIME_DIR` if set). |
 | `data/data_package.json`, `data/datapackage_cache/`, `data/logs/` | Shared by every run. |
 
