@@ -48,7 +48,7 @@ def satisfies(node: dict, held: dict) -> bool:
 # Item colours, shared with the bot so both colour items the same way. Classification bits are
 # Archipelago's own: 1 progression, 2 useful, 4 trap. Each is bold, then a named colour for clients
 # without truecolor, then the exact RGB shade (38;2;R;G;B), which wins where it is supported.
-ANSI_PROGRESSION = "\x1b[1;35;38;2;182;0;251m"  # #B600FB
+ANSI_PROGRESSION = "\x1b[1;35;38;2;171;87;255m"  # #AB57FF
 ANSI_USEFUL = "\x1b[1;34;38;2;64;64;222m"       # #4040DE
 ANSI_TRAP = "\x1b[1;31;38;2;222;64;64m"         # #DE4040
 ANSI_RESET = "\x1b[0m"
