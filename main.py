@@ -909,10 +909,12 @@ def _preferences_reply(run, notes=()) -> str:
 @option("filler_color", description="Hex colour for filler items, e.g. 5BCEFA. 'default' puts it back.", required=False)
 @option("show_filler", description="Post filler items in the item thread too. Off (the default) hides them.",
         required=False)
+@option("hide_traps", description="Leave trap items out of the item thread. Off (the default) posts them.",
+        required=False)
 @option("reset_all", description="Put every preference back to its default.", required=False)
 async def preferences_command(ctx, progression_color: str = None, useful_color: str = None,
                               trap_color: str = None, filler_color: str = None, show_filler: bool = None,
-                              reset_all: bool = False):
+                              hide_traps: bool = None, reset_all: bool = False):
     if not is_owner_or_admin(ctx):
         await ctx.respond("Only the bot owner or a server administrator can change preferences.", ephemeral=True)
         return
@@ -920,7 +922,8 @@ async def preferences_command(ctx, progression_color: str = None, useful_color: 
     if not ok:
         return
     asked = {"color_progression": progression_color, "color_useful": useful_color,
-             "color_trap": trap_color, "color_filler": filler_color, "show_filler": show_filler}
+             "color_trap": trap_color, "color_filler": filler_color, "show_filler": show_filler,
+             "hide_traps": hide_traps}
     changes, problems = {}, []
     if reset_all:
         changes = {s.key: None for s in run_prefs.SETTINGS}
@@ -2040,18 +2043,22 @@ async def no_dm_tracker(tracker_url, auth, run=None):
 
 
 async def _hide_filler(diff, run=None):
-    """The feed's diff without filler items, per the registered seed. Any problem getting the
-    classifications leaves the diff as it was, so the feed never goes quiet by mistake. A run that
-    turned on "show filler items" keeps everything."""
+    """The feed's diff without the items the run hides, per the registered seed: filler (unless the
+    run turned on "show filler items") and traps (when it turned on "hide trap items"). Any problem
+    getting the classifications or the preferences leaves the diff as it was, so the feed never goes
+    quiet by mistake."""
     try:
-        if run_prefs.get("show_filler", run):
+        filler = not run_prefs.get("show_filler", run)
+        traps = bool(run_prefs.get("hide_traps", run))
+        if not (filler or traps):
             return diff
         item_flags = await gomode_bot.load_item_flags(**_rk(run))
         if not item_flags:
             return diff
-        return gomode_bot.drop_filler(diff, item_flags, gomode_bot._load_items_received(**_rk(run)))
+        return gomode_bot.drop_filler(diff, item_flags, gomode_bot._load_items_received(**_rk(run)),
+                                      filler=filler, traps=traps)
     except Exception as e:
-        log_error.exception("Filler filter failed, posting everything: %s", e)
+        log_error.exception("Item filter failed, posting everything: %s", e)
         return diff
 
 
@@ -2084,7 +2091,7 @@ async def check_for_item_changes(tracker_url, auth, channel_id, run=None):
             if diff:
                 diff = await _hide_filler(diff, **_rk(run))
                 if not diff:
-                    log_feed.info("Only filler items received, nothing posted")
+                    log_feed.info("Only hidden items received, nothing posted")
             if diff:
                 message = format_diff_message(diff, await _item_flags_for(run),
                                               gomode_bot._load_items_received(**_rk(run)), _palette(run))

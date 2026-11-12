@@ -825,11 +825,22 @@ def slot_item_flags(item_flags, items_received, slot_name) -> dict:
     return rec.get("items", {})
 
 
-def drop_filler(diff: dict, item_flags: dict, items_received: dict) -> dict:
-    """The tracker diff ({slot: {slot_name: {"New Items": {name: count}, ...}}}) without filler.
+def _is_hidden(flags, filler: bool, traps: bool) -> bool:
+    if not isinstance(flags, int):
+        return False
+    if flags == 0:
+        return filler
+    return traps and bool(flags & 4) and not flags & 3
+
+
+def drop_filler(diff: dict, item_flags: dict, items_received: dict, filler: bool = True,
+                traps: bool = False) -> dict:
+    """The tracker diff ({slot: {slot_name: {"New Items": {name: count}, ...}}}) without filler
+    (when filler is true) and without traps (when traps is true).
 
     A name is filler only if every copy of it in the seed is (Celeste 64's extra strawberries
-    are filler but the name isn't). Unknown names, and slots whose tracker game doesn't match
+    are filler but the name isn't); a name is a trap only if it is flagged a trap and is not
+    also progression or useful. Unknown names, and slots whose tracker game doesn't match
     the registered seed, are left alone. A slot left with nothing to report is dropped."""
     kept: dict = {}
     for slot, slot_entry in diff.items():
@@ -839,7 +850,7 @@ def drop_filler(diff: dict, item_flags: dict, items_received: dict) -> dict:
             if rec and not (tracker_game and tracker_game.lower() != str(rec.get("game", "")).lower()):
                 flags = rec.get("items", {})
                 new_items = {name: count for name, count in details.get("New Items", {}).items()
-                             if flags.get(name) != 0}
+                             if not _is_hidden(flags.get(name), filler, traps)}
                 details = {**details, "New Items": new_items} if new_items else \
                     {k: v for k, v in details.items() if k != "New Items"}
             if details.get("New Items") or "Goal Completed" in details:

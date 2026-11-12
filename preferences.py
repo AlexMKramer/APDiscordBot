@@ -39,6 +39,8 @@ SETTINGS = (
     Setting("color_filler", "colour", DEFAULT_PALETTE["filler"], "Filler item colour", "Filler items."),
     Setting("show_filler", "bool", False, "Show filler items in the feed",
             "Post filler items in the item thread, in the filler colour. Off hides them."),
+    Setting("hide_traps", "bool", False, "Hide trap items in the feed",
+            "Leave trap items out of the item thread. Off posts them."),
 )
 BY_KEY = {s.key: s for s in SETTINGS}
 
