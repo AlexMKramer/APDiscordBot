@@ -24,6 +24,7 @@ import runs
 import sys
 
 import log_setup
+from gomode_analyzer.precompute import slot_limits  # plain Python: no Archipelago import
 
 log_goal = log_setup.get('goal')
 log_checks = log_setup.get('checks')
@@ -44,6 +45,14 @@ APWORLDS_DIR = os.getenv("GOMODE_APWORLDS_DIR")
 AP_REPO = os.getenv("GOMODE_AP_REPO")
 # Where provisioned AP trees + the precomputed seed cache live.
 RUNTIME_DIR = os.getenv("GOMODE_RUNTIME_DIR", os.path.join(ANALYZER_DIR, "runtime"))
+
+
+# Seconds one slot may take in the precompute before it is put off until the other slots are done
+# (GOMODE_SLOT_TIMEOUT, default 300), and the longer limit it then gets on its retry before it is
+# recorded as unsupported (GOMODE_SLOT_RETRY_TIMEOUT, default 1800; 0 means no retry).
+SLOT_TIMEOUT, SLOT_RETRY_TIMEOUT = slot_limits()
+# The registration's progress message is edited at most this often (seconds).
+PROGRESS_INTERVAL = 5.0
 
 DATA_DIR = "data"
 
@@ -77,6 +86,146 @@ async def _run(cmd: list[str]) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE)
     out, err = await proc.communicate()
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+
+async def _run_with_progress(cmd: list[str], on_event) -> tuple[int, str, str]:
+    """Like _run, but reads stderr as it arrives: each JSON line with a "progress" key is handed
+    to `await on_event(event)` and left out of the returned stderr text."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    err_lines: list[str] = []
+
+    async def handle(raw: bytes) -> None:
+        line = raw.decode("utf-8", "replace")
+        if line.lstrip().startswith("{"):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                event = None
+            if isinstance(event, dict) and "progress" in event:
+                try:
+                    await on_event(event)
+                except Exception:
+                    log_error.exception("Could not report precompute progress")
+                return
+        err_lines.append(line)
+
+    async def pump() -> None:
+        buf = b""
+        while True:
+            chunk = await proc.stderr.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            for raw in lines:
+                await handle(raw.rstrip(b"\r"))
+        if buf:
+            await handle(buf.rstrip(b"\r"))
+
+    out, _ = await asyncio.gather(proc.stdout.read(), pump())
+    await proc.wait()
+    return proc.returncode, out.decode("utf-8", "replace"), "\n".join(err_lines)
+
+
+def _duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def _limit_text(seconds) -> str:
+    """'a 30-minute limit' / 'a 90-second limit'."""
+    seconds = float(seconds or 0)
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"a {int(seconds // 60)}-minute limit"
+    return f"a {seconds:g}-second limit"
+
+
+class _Progress:
+    """Turns the precompute's progress events into bot log lines and a progress message that is
+    sent at most every PROGRESS_INTERVAL seconds (the newest text wins; a held-back one is sent
+    once the interval has passed)."""
+
+    def __init__(self, say):
+        self.say = say
+        self.last = asyncio.get_running_loop().time()   # the message just sent stays up a while
+        self.pending: str | None = None
+        self.timer: asyncio.Task | None = None
+
+    async def _send(self, text: str) -> None:
+        self.last = asyncio.get_running_loop().time()
+        self.pending = None
+        await self.say(text)
+
+    async def _later(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        self.timer = None
+        if self.pending is not None:
+            try:
+                await self._send(self.pending)
+            except Exception:
+                log_error.exception("Could not show precompute progress")
+
+    async def show(self, text: str, now: bool = False) -> None:
+        wait = PROGRESS_INTERVAL - (asyncio.get_running_loop().time() - self.last)
+        if now or wait <= 0:
+            self.cancel()
+            await self._send(text)
+            return
+        self.pending = text
+        if self.timer is None:
+            self.timer = asyncio.create_task(self._later(wait))
+
+    def cancel(self) -> None:
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+        self.pending = None
+
+    async def event(self, ev: dict) -> None:
+        kind = ev.get("progress")
+        where = f"{ev.get('index')}/{ev.get('total')}"
+        who = f"{ev.get('name')} ({ev.get('game')})"
+        if kind == "loading":
+            if ev.get("attempt", 1) > 1:
+                log_goal.info("Precompute: restarting the analysis for the remaining slots")
+            else:
+                log_goal.info("Precompute: loading the seed and its worlds")
+            await self.show("Loading the seed and its worlds for the go-mode analysis...")
+        elif kind == "start":
+            again = " (retry)" if ev.get("retry") else ""
+            log_goal.info("Precompute: analyzing slot %s: %s%s", where, who, again)
+            await self.show(f"{'Retrying' if again else 'Analyzing'} slot {where}: {who}...")
+        elif kind == "done":
+            log_goal.info("Precompute: slot %s %s finished in %ss%s: %s", where, who, ev.get("seconds"),
+                          " on its retry" if ev.get("retry") else "", ev.get("status"))
+        elif kind == "deferred":
+            text = f"Slot {where} {who} ran past {ev.get('limit'):g}s, will retry at the end"
+            log_goal.info("Precompute: %s", text)
+            await self.show(text + ". Continuing with the rest...", now=True)
+        elif kind == "retrying":
+            n = ev.get("count")
+            text = f"Retrying {n} slot{'s' if n != 1 else ''} with {_limit_text(ev.get('limit'))}"
+            log_goal.info("Precompute: %s", text)
+            await self.show(text + "...", now=True)
+        elif kind == "timeout":
+            log_goal.info("Precompute: slot %s %s stopped after %ss (over the %gs %slimit), marked unsupported",
+                          where, who, ev.get("seconds"), ev.get("limit"), "retry " if ev.get("retry") else "")
+            await self.show(f"Slot {where}: {who} took longer than {ev.get('limit'):g} seconds"
+                            f"{' on its retry' if ev.get('retry') else ''} and was skipped. "
+                            "Continuing with the rest...", now=True)
+        elif kind == "finished":
+            again = ev.get("retried_ok")
+            over = ev.get("timed_out")
+            text = (f"Analyzed {ev.get('slots')} slots in {_duration(ev.get('seconds') or 0)}: "
+                    f"{ev.get('ok')} ok{f' ({again} on a retry)' if again else ''}, "
+                    f"{ev.get('unsupported')} unsupported"
+                    + (f" ({over} past {'both time limits' if ev.get('retry_limit') else 'the time limit'})"
+                       if over else "")
+                    + f", {ev.get('errors')} errors.")
+            log_goal.info("Precompute: %s", text)
+            await self.show(text, now=True)
 
 
 def _quiet_remove(path: str) -> None:
@@ -146,9 +295,15 @@ async def register_seed(seed_zip: str, *, progress=None, run=None) -> dict:
     #    swap it into place once the run is known-good, so a failed re-registration can't
     #    truncate the live cache and silently break the previously-registered seed.
     tmp_cache = runs.seed_cache_path(run) + ".tmp"
+    #    Each slot's start and finish arrive as progress events while it runs.
     cmd = [AP_PYTHON, os.path.join(ANALYZER_DIR, "precompute.py"),
-           "--ap-path", ap_path, "--seed-zip", seed_zip, "--out", tmp_cache]
-    rc, out, err = await _run(cmd)
+           "--ap-path", ap_path, "--seed-zip", seed_zip, "--out", tmp_cache,
+           "--slot-timeout", f"{SLOT_TIMEOUT:g}", "--retry-timeout", f"{SLOT_RETRY_TIMEOUT:g}"]
+    shown = _Progress(say)
+    try:
+        rc, out, err = await _run_with_progress(cmd, shown.event)
+    finally:
+        shown.cancel()
     if rc != 0:
         _quiet_remove(tmp_cache)
         raise RuntimeError(f"Precompute failed:\n{(err or out)[-1500:]}")

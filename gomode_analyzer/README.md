@@ -102,7 +102,17 @@ Config (environment):
 | `GOMODE_APWORLDS_DIR` | The host's `custom_worlds/` on the bot server (FTP'd there). With several runs, a folder inside it named after a run (its name, else its id) holds that run's own set of apworlds; a run without one uses the apworlds directly in this directory. See `docs/RUNS.md`. |
 | `GOMODE_AP_REPO` | *(optional)* local AP git checkout for offline provisioning; else GitHub. |
 | `GOMODE_RUNTIME_DIR` | Where provisioned trees + the seed cache live (default `gomode_analyzer/runtime`). |
+| `GOMODE_SLOT_TIMEOUT` | *(optional)* seconds the precompute may spend on one slot (default 300). A slot over the limit is put off, a new worker carries on with the remaining slots, and the put-off slots are retried at the end. |
+| `GOMODE_SLOT_RETRY_TIMEOUT` | *(optional)* seconds a put-off slot may take on its retry (default 1800, or twice `GOMODE_SLOT_TIMEOUT` if that is more). A slot past both limits is recorded as unsupported, with both limits in the reason. 0, or a value not above `GOMODE_SLOT_TIMEOUT`, skips the retry. |
 | `GOMODE_OWNER_ID` / `OWNER_ID` | Discord user allowed to register; else the guild owner. |
+
+While the precompute runs, it reports each slot as it starts and finishes (JSON lines on its
+stderr; the summary stays the last line of stdout). The bot logs every one of them under
+`[goal]` and edits the `/register_seed` reply at most every few seconds, e.g.
+"Analyzing slot 34/90: Player34 (Crab Champions)...". A put-off slot gets its own line, and so does
+the start of the retries ("Retrying 2 slots with a 30-minute limit"). It ends with a count of ok
+slots (and how many of them on a retry), unsupported slots (and how many ran past the limits),
+errors, and the time it took.
 
 With several runs linked (see `docs/RUNS.md`), `/register_seed` registers the seed for the run of the channel it is
 used in, and each run has its own analyzer, Archipelago tree and apworlds (`runtime/<run>/`), seed cache (`runtime/<run>/seed_cache.json`) and `data/runs/<run>/` copies of
